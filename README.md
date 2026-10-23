@@ -1,10 +1,12 @@
+<a href="https://netec.com">
+  <img src="https://static.wixstatic.com/media/96edd2_934dddb3230b4b16b1d1c56c51143738~mv2.png" alt="Logo de Netec" width="300"/>
+</a>
+
 # Elastic Stack para gestión centralizada de logs
 
 Curso práctico orientado a la recolección, procesamiento, normalización, visualización, alertamiento y diagnóstico de logs de aplicaciones en servicios cloud, utilizando Elasticsearch, Kibana, Logstash, Beats, Elastic Agent y Fleet en entornos 7.17 y 9.3.
 
-## Estructura
 
-- `CapituloXX/README.md`: guía de laboratorio por capítulo.
 
 ## Lista de laboratorios
 
@@ -68,8 +70,14 @@ Curso práctico orientado a la recolección, procesamiento, normalización, visu
   - Descripción: Configurar, validar y presentar una solución integral que recolecte, procese, almacene, visualice, proteja y permita diagnosticar logs de aplicaciones, verificando criterios de aceptación, calidad, rendimiento y pruebas operativas.
   - Duración estimada: 51 min
 
-## Flujo de colaboración
+------
 
-- Trabajar en `changes_course`.
-- Crear Pull Request hacia `main`.
-- Merge por `Squash and merge`.
+## 📬 **Contacto y más información**
+
+Si tienes alguna pregunta o necesitas más detalles, no dudes en [contactarnos](mailto:soporte@netec.com). También puedes encontrar más recursos en nuestra [página](https://netec.com).
+
+---
+
+
+¡Gracias por visitar nuestra plataforma! No olvides revisar todos los laboratorios y comenzar tu viaje de aprendizaje hoy mismo.
+
