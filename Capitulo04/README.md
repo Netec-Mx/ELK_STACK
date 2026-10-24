@@ -1,954 +1,652 @@
-# Construir y depurar un pipeline de Logstash para logs de aplicaciones
+# ELK Stack: Elasticsearch, Logstash y Kibana
 
-## Metadata
+## Práctica 4. Responder preguntas de negocio y operación con consultas
 
-| Campo | Valor |
-|-------|-------|
-| **Duración** | 54 minutos |
-| **Complejidad** | Alta |
-| **Nivel Bloom** | Crear |
+### Objetivo
 
-## Descripción General
+Al finalizar la práctica, serás capaz de:
 
-En esta práctica construirás un pipeline completo de Logstash que procesa logs de una aplicación Java con excepciones multiline. Partirás de un archivo de configuración incompleto con secciones marcadas como `TODO`, aplicarás plugins de filtrado (grok, dissect, date, json, mutate, geoip, translate) para normalizar los eventos al estándar ECS, y depurarás errores intencionales utilizando los logs de Logstash y la Dead Letter Queue. El resultado será un índice `labs-logstash-app-{fecha}` correctamente mapeado que servirá como fuente de datos para el dashboard de la Práctica 5.
+-   Construir búsquedas de texto completo con tolerancia a errores,
+    ponderación de campos y resaltado.
+-   Combinar consultas y filtros con `bool` y entender la diferencia
+    entre contexto de consulta y de filtro.
+-   Calcular indicadores con agregaciones de métricas, buckets y
+    pipeline.
+-   Resolver preguntas con ES\|QL y exportar resultados en CSV.
+-   Recorrer más de 10 000 resultados con *point in time* (PIT) y
+    `search_after`.
 
-## Objetivos de Aprendizaje
+### Objetivo visual
 
-- [ ] Construir un pipeline de Logstash funcional con input file (codec multiline), múltiples filters y output a Elasticsearch
-- [ ] Aplicar los plugins grok, dissect, mutate, date, json, geoip y translate para extraer, normalizar y enriquecer campos de logs Java
-- [ ] Mapear campos extraídos al estándar ECS (log.level, log.logger, error.message, error.stack_trace)
-- [ ] Configurar y utilizar la Dead Letter Queue (DLQ) para capturar y diagnosticar eventos fallidos
-- [ ] Depurar errores de parsing en un pipeline de Logstash mediante análisis de logs y corrección iterativa
+![Tres fuentes y quince preguntas](img/lab04.png){width="6.3in"}\
 
-## Prerrequisitos
+### Duración aproximada
 
-### Conocimiento Previo
+-   105 minutos.
 
-- Comprensión de la arquitectura de Logstash (inputs, filters, outputs, codecs) — Lección 4.1
-- Familiaridad con expresiones regulares básicas para patrones grok
-- Práctica 2 completada: index template `labs-logstash-template` y política ILM `labs-policy` activos en Elasticsearch
-- Práctica 3 completada: experiencia con flujos de datos end-to-end
+### Prerrequisitos
 
-### Acceso Requerido
+-   Práctica 3 completada: alias `products` (60 productos) y data stream
+    `logs-mercanova.app-default` (12 500 eventos).
+-   Archivo `data/lab04/orders.ndjson` con 1 800 pedidos del 13 al 19 de
+    octubre de 2026.
 
-- Acceso al host Ubuntu 22.04 con Docker Engine y Docker Compose operativos
-- Contenedores `es01` y `kibana01` en ejecución y saludables
-- Puerto 9200 (Elasticsearch) y 5601 (Kibana) accesibles desde el host
-- Directorio de trabajo `~/elastic-labs/` con permisos de escritura
+### Instrucciones
 
-## Entorno del Laboratorio
+**Escenario:** el director de MercaNova convocó a una reunión para
+revisar la semana del 13 al 19 de octubre. Quiere respuestas concretas:
+cuánto se vendió, en qué regiones, qué servicio falló y cuándo. Tu tarea
+es responder **15 preguntas** con consultas sobre tres fuentes:
+`products`, `orders` y `logs-mercanova.app-default`.
 
-### Software Utilizado
+Cada pregunta incluye la consulta de solución y el **resultado
+esperado**. Recomendación: intenta escribir tú la consulta antes de leer
+la solución.
 
-| Componente | Versión | Rol |
-|---|---|---|
-| Logstash | 8.14.1 | Motor de procesamiento de pipeline |
-| Elasticsearch | 8.14.1 | Almacenamiento e indexación de eventos |
-| Kibana | 8.14.1 | Validación visual de documentos |
-| Docker / Docker Compose | 26.1.4 / 2.27.1 | Orquestación de contenedores |
+**Fechas y zonas horarias:** los datos están en hora local de la Ciudad
+de México (UTC-06:00) y Elasticsearch los guarda en UTC. Por eso las
+consultas usan fechas con desfase (`2026-10-19T00:00:00-06:00`) y las
+agregaciones de fecha usan `time_zone`. Una búsqueda por "hoy" o "últimas
+24 horas" no encontraría nada: los datos son de octubre de 2026.
 
-### Configuración Inicial del Entorno
+------------------------------------------------------------------------
 
-Verifica que los contenedores base estén en ejecución:
+### Tarea 1. Preparar el índice de pedidos
 
-```bash
-cd ~/elastic-labs
-docker compose ps --format "table {{.Name}}\t{{.Status}}"
-```
+#### Paso 1. Crea el índice `orders` con mapping explícito
 
-Resultado esperado: `es01` y `kibana01` con estado `healthy`.
-
-Verifica que el index template de la Práctica 2 exista:
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  https://localhost:9200/_index_template/labs-logstash-template | jq .
-```
-
-Si no existe, créalo antes de continuar (consulta la guía de la Práctica 2).
-
----
-
-## Paso a Paso
-
-### Paso 1: Crear el archivo de logs de muestra (java_exception.log)
-
-**Objetivo:** Generar el archivo de logs de aplicación Java con excepciones multiline que Logstash procesará.
-
-**Instrucciones:**
-
-1. Crea el directorio para los logs de entrada:
-
-```bash
-mkdir -p ~/elastic-labs/logs/logstash-input
-```
-
-2. Crea el archivo de logs de muestra con eventos multiline:
-
-```bash
-cat > ~/elastic-labs/logs/logstash-input/java_exception.log << 'EOF'
-2024-06-15 10:23:45.123 ERROR com.labs.service.PaymentService - Payment processing failed | client_ip=203.0.113.45 | error_code=PAY_001 | context={"transaction_id":"txn-7890","amount":150.00,"currency":"USD"}
-java.lang.NullPointerException: Cannot invoke method on null object
-	at com.labs.service.PaymentService.processPayment(PaymentService.java:142)
-	at com.labs.controller.PaymentController.handleRequest(PaymentController.java:87)
-	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:897)
-2024-06-15 10:23:46.456 WARN com.labs.service.AuthService - Authentication attempt suspicious | client_ip=198.51.100.22 | error_code=AUTH_003 | context={"user_id":"usr-1234","attempts":5,"locked":true}
-2024-06-15 10:23:47.789 ERROR com.labs.service.OrderService - Order creation failed | client_ip=192.0.2.100 | error_code=ORD_002 | context={"order_id":"ord-5678","items":3,"total":299.99}
-java.io.IOException: Connection reset by peer
-	at com.labs.service.OrderService.createOrder(OrderService.java:203)
-	at com.labs.controller.OrderController.submitOrder(OrderController.java:54)
-	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:897)
-	at javax.servlet.http.HttpServlet.service(HttpServlet.java:750)
-2024-06-15 10:23:48.012 INFO com.labs.service.UserService - User profile updated successfully | client_ip=45.33.32.156 | error_code=NONE | context={"user_id":"usr-9999","fields_updated":["email","phone"]}
-2024-06-15 10:23:49.345 ERROR com.labs.service.InventoryService - Stock check failed | client_ip=104.236.198.48 | error_code=INV_004 | context={"product_id":"prod-4321","warehouse":"US-EAST","requested":10}
-java.sql.SQLException: Connection pool exhausted
-	at com.labs.service.InventoryService.checkStock(InventoryService.java:88)
-	at com.labs.controller.InventoryController.getAvailability(InventoryController.java:33)
-2024-06-15 10:23:50.678 WARN com.labs.service.NotificationService - Email delivery delayed | client_ip=203.0.113.12 | error_code=NOTIF_005 | context={"recipient":"user@example.com","retry_count":3,"queue_depth":150}
-2024-06-15 10:23:51.901 ERROR com.labs.service.CacheService - Cache invalidation error | client_ip=198.51.100.55 | error_code=CACHE_006 | context={"cache_region":"products","keys_affected":42,"ttl_remaining":0}
-java.util.concurrent.TimeoutException: Redis operation timed out after 5000ms
-	at com.labs.service.CacheService.invalidateRegion(CacheService.java:156)
-	at com.labs.scheduler.CacheMaintenanceJob.execute(CacheMaintenanceJob.java:29)
-EOF
-```
-
-3. Verifica el archivo:
-
-```bash
-wc -l ~/elastic-labs/logs/logstash-input/java_exception.log
-```
-
-**Resultado esperado:** `25 /home/.../java_exception.log` (25 líneas totales que formarán 7 eventos lógicos tras agrupar multiline).
-
-**Verificación:** El archivo contiene 4 eventos ERROR con stack traces y 3 eventos sin stack trace (WARN/INFO).
-
----
-
-### Paso 2: Crear el diccionario de traducción para el plugin translate
-
-**Objetivo:** Preparar el archivo CSV que mapea códigos de error a descripciones legibles.
-
-**Instrucciones:**
-
-1. Crea el directorio de configuración de Logstash:
-
-```bash
-mkdir -p ~/elastic-labs/config/logstash/dictionaries
-```
-
-2. Crea el archivo de diccionario:
-
-```bash
-cat > ~/elastic-labs/config/logstash/dictionaries/error_codes.csv << 'EOF'
-PAY_001,Payment gateway timeout or rejection
-AUTH_003,Multiple failed authentication attempts detected
-ORD_002,Order persistence failure due to backend connectivity
-INV_004,Inventory database connection pool exhausted
-NOTIF_005,Notification service delivery delay
-CACHE_006,Cache backend operation timeout
-NONE,No error - successful operation
-EOF
-```
-
-3. Verifica el contenido:
-
-```bash
-cat ~/elastic-labs/config/logstash/dictionaries/error_codes.csv
-```
-
-**Resultado esperado:** 7 líneas con formato `CÓDIGO,Descripción`.
-
----
-
-### Paso 3: Crear el pipeline de Logstash completo
-
-**Objetivo:** Construir el archivo de configuración del pipeline con input multiline, filters de procesamiento y output a Elasticsearch.
-
-**Instrucciones:**
-
-1. Crea el directorio para el pipeline:
-
-```bash
-mkdir -p ~/elastic-labs/config/logstash/pipeline
-```
-
-2. Crea el archivo de configuración del pipeline:
-
-```bash
-cat > ~/elastic-labs/config/logstash/pipeline/labs-app-pipeline.conf << 'PIPELINE'
-# Pipeline: labs-app-pipeline
-# Procesa logs de aplicación Java con excepciones multiline
-# Normaliza al estándar ECS y enriquece con geoip y translate
-
-input {
-  file {
-    path => "/var/log/app/java_exception.log"
-    start_position => "beginning"
-    sincedb_path => "/dev/null"
-    codec => multiline {
-      pattern => "^%{TIMESTAMP_ISO8601}"
-      negate => true
-      what => "previous"
+``` 
+PUT orders
+{
+  "settings": { "number_of_shards": 1, "number_of_replicas": 1 },
+  "mappings": {
+    "dynamic": false,
+    "properties": {
+      "order_id":   { "type": "long" },
+      "@timestamp": { "type": "date" },
+      "updated_at": { "type": "date" },
+      "status":     { "type": "keyword" },
+      "total":      { "type": "scaled_float", "scaling_factor": 100 },
+      "items":      { "type": "integer" },
+      "customer": { "properties": {
+        "id":     { "type": "keyword" },
+        "name":   { "type": "text",
+                    "fields": { "raw": { "type": "keyword" } } },
+        "email":  { "type": "keyword" },
+        "phone":  { "type": "keyword" },
+        "region": { "type": "keyword" },
+        "city":   { "type": "keyword" } } },
+      "payment": { "properties": {
+        "method":     { "type": "keyword" },
+        "card_last4": { "type": "keyword" } } }
     }
-    type => "java_app"
   }
 }
+```
 
-filter {
-  # --- FASE 1: Extracción inicial con grok ---
-  grok {
-    match => {
-      "message" => "^%{TIMESTAMP_ISO8601:raw_timestamp}\s+%{LOGLEVEL:raw_level}\s+%{JAVACLASS:raw_logger}\s+-\s+%{DATA:raw_message}\s+\|\s+client_ip=%{IP:raw_client_ip}\s+\|\s+error_code=%{WORD:raw_error_code}\s+\|\s+context=%{GREEDYDATA:raw_context}"
-    }
-    tag_on_failure => ["_grokparsefailure"]
-  }
+**Qué hace y por qué:** el índice guardará pedidos, que no son series de
+tiempo append-only (cambian de estado), por eso es un índice normal y no
+un data stream. `"dynamic": false` acepta campos no declarados, los guarda
+en `_source`, pero **no los indexa**: es menos estricto que `strict` y
+evita que Logstash falle en la práctica 5 si agrega algún campo extra.
+`customer.email` y `phone` son `keyword` porque se filtran por valor
+exacto; en la práctica 8 los ocultarás con seguridad a nivel de campo.
 
-  # --- FASE 2: Extraer stack trace si existe ---
-  if [message] =~ /\n\t/ {
-    dissect {
-      mapping => {
-        "message" => "%{raw_first_line}
-%{raw_stack_trace}"
+#### Paso 2. Carga los pedidos
+
+``` 
+$ source /home/student/labs/scripts/env.sh && cd $LABS
+$ scripts/bulk-load.sh orders data/lab04/orders.ndjson
+Operaciones: 1800  ·  con error: 0
+```
+
+**Qué hace y por qué:** cada acción del archivo es
+`{"index":{"_id":"88001"}}`: el `_id` es el número de pedido. Así, en la
+práctica 5, Logstash podrá volver a escribir los mismos pedidos desde
+MariaDB sin duplicarlos.
+
+#### Paso 3. Verifica las tres fuentes
+
+``` 
+GET _cat/count/orders?v
+GET _cat/count/products?v
+GET _cat/count/logs-mercanova.app-default?v
+```
+
+**Qué hace y por qué:** confirma el punto de partida: 1 800 pedidos, 60
+productos y 12 500 eventos de aplicación. Si algún conteo no coincide,
+corrige la carga antes de seguir: los resultados esperados dependen de
+estos datos.
+
+### Tarea 2. Búsqueda
+
+#### Pregunta 1. ¿Qué productos coinciden con "audifonos inalambircos", escrito con errores?
+
+``` 
+GET products/_search
+{
+  "query": {
+    "match": {
+      "name": {
+        "query": "audifonos inalambircos",
+        "operator": "and",
+        "fuzziness": "AUTO"
       }
     }
-    # Limpiar: solo conservar desde la primera línea de excepción
-    mutate {
-      gsub => [
-        "raw_stack_trace", "^[^\n]*\n", ""
+  },
+  "highlight": { "fields": { "name": {} } },
+  "_source": [ "sku", "name", "price" ]
+}
+```
+
+**Qué hace y por qué:**
+
+| Parámetro | Efecto |
+|------------------|------------------------------------------|
+| `match` | Analiza el texto con el analizador del campo (`es_folded`): minúsculas y sin acentos. |
+| `operator: and` | Exige **todos** los términos; con `or`, el valor por defecto, bastaría uno. |
+| `fuzziness: AUTO` | Tolera errores de escritura según la longitud del término: 0 cambios hasta 2 letras, 1 hasta 5 y 2 a partir de 6. "inalambircos" está a 2 cambios de "inalambricos". |
+| `highlight` | Devuelve el fragmento con las coincidencias marcadas con `<em>`. |
+
+**Resultado esperado:** 1 resultado, `SKU-1001` *Audífonos inalámbricos
+Pro*, con el resaltado `<em>Audífonos</em> <em>inalámbricos</em> Pro`.
+
+#### Pregunta 2. ¿Qué productos se relacionan con "bocina bluetooth", dando más peso al nombre?
+
+``` 
+GET products/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "bocina bluetooth",
+      "fields": [ "name^3", "description" ]
+    }
+  },
+  "_source": [ "name" ]
+}
+```
+
+**Qué hace y por qué:** `multi_match` busca en varios campos; `^3`
+multiplica por 3 el peso de las coincidencias en `name`. Por defecto usa
+el tipo `best_fields`: el score de cada documento es el de su mejor
+campo. El orden lo decide **BM25**: un producto con las dos palabras en
+el nombre supera a los que solo tienen una.
+
+**Resultado esperado:** 4 resultados; el primero es *Bocina Bluetooth
+portátil*. Los otros tres (*Bocina inteligente con asistente*,
+*Audífonos deportivos Bluetooth* y *Tocadiscos con Bluetooth*) tienen
+solo una de las palabras.
+
+#### Pregunta 3. ¿Qué productos de audio cuestan entre 500 y 1 500 pesos, del más barato al más caro?
+
+``` 
+GET products/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term":  { "category": "audio" } },
+        { "range": { "price": { "gte": 500, "lte": 1500 } } }
       ]
     }
-    # Extraer el nombre de la excepción del stack trace
-    grok {
-      match => {
-        "message" => "\n(?<raw_exception_class>[a-zA-Z0-9_.]+Exception|[a-zA-Z0-9_.]+Error):\s*(?<raw_exception_message>[^\n]+)"
-      }
-      tag_on_failure => ["_grok_exception_parse_failure"]
-    }
-  }
+  },
+  "sort": [ { "price": "asc" } ],
+  "_source": [ "sku", "name", "price" ]
+}
+```
 
-  # --- FASE 3: Parsear el campo de contexto JSON ---
-  if [raw_context] {
-    json {
-      source => "raw_context"
-      target => "event_context"
-      tag_on_failure => ["_jsonparsefailure"]
-    }
-  }
+**Qué hace y por qué:** ambas condiciones van en `filter` porque son de
+sí o no: no calculan score y sus resultados se **cachean**, lo que las
+hace más rápidas. `term` compara el valor exacto contra el campo
+`keyword`. Al ordenar por `price`, el `_score` deja de importar y vale
+`null`.
 
-  # --- FASE 4: Normalizar timestamp ---
-  date {
-    match => ["raw_timestamp", "yyyy-MM-dd HH:mm:ss.SSS"]
-    target => "@timestamp"
-    timezone => "UTC"
-    tag_on_failure => ["_dateparsefailure"]
-  }
+**Resultado esperado:** 5 productos:
 
-  # --- FASE 5: Enriquecimiento GeoIP ---
-  if [raw_client_ip] {
-    geoip {
-      source => "raw_client_ip"
-      target => "source.geo"
-      tag_on_failure => ["_geoip_lookup_failure"]
-    }
-  }
+| SKU | Producto | Precio |
+|------------|---------------------------------------|---------|
+| SKU-1002 | Audífonos deportivos Bluetooth | 899 |
+| SKU-1005 | Bocina Bluetooth portátil | 1 199 |
+| SKU-1004 | Audífonos gamer RGB | 1 299 |
+| SKU-1010 | Amplificador de audio compacto | 1 399 |
+| SKU-1007 | Bocina inteligente con asistente | 1 499 |
 
-  # --- FASE 6: Traducción de códigos de error ---
-  if [raw_error_code] {
-    translate {
-      field => "raw_error_code"
-      destination => "error.description"
-      dictionary_path => "/usr/share/logstash/config/dictionaries/error_codes.csv"
-      fallback => "Unknown error code"
-    }
-  }
+#### Pregunta 4. ¿Cuántos errores de timeout tuvo payment el 19 de octubre, sin contar el host de pruebas?
 
-  # --- FASE 7: Mapeo a ECS y limpieza ---
-  mutate {
-    rename => {
-      "raw_level" => "[log][level]"
-      "raw_logger" => "[log][logger]"
-      "raw_client_ip" => "[source][ip]"
-      "raw_error_code" => "[error][code]"
-      "raw_message" => "[message_parsed]"
+``` 
+GET logs-mercanova.app-default/_search
+{
+  "track_total_hits": true,
+  "size": 3,
+  "query": {
+    "bool": {
+      "must":     [ { "match": { "message": "timeout" } } ],
+      "filter":   [
+        { "term":  { "service.name": "payment" } },
+        { "term":  { "log.level": "error" } },
+        { "range": { "@timestamp": {
+            "gte": "2026-10-19T00:00:00-06:00",
+            "lt":  "2026-10-20T00:00:00-06:00" } } }
+      ],
+      "must_not": [ { "term": { "host.name": "test-01" } } ]
     }
-  }
+  },
+  "_source": [ "@timestamp", "host.name", "message" ]
+}
+```
 
-  # Mapear excepción a campos ECS de error
-  if [raw_exception_class] {
-    mutate {
-      rename => {
-        "raw_exception_class" => "[error][type]"
-        "raw_exception_message" => "[error][message]"
-      }
-    }
-    # Extraer stack trace completo para ECS
-    if [raw_stack_trace] {
-      mutate {
-        rename => {
-          "raw_stack_trace" => "[error][stack_trace]"
-        }
-      }
-    }
-  }
+**Qué hace y por qué:**
 
-  # Normalizar log.level a minúsculas para consistencia ECS
-  if [log][level] {
-    mutate {
-      lowercase => ["[log][level]"]
-    }
-  }
+| Cláusula | Contexto | Uso en esta consulta |
+|-----------|---------|-----------------------------------------|
+| `must` | consulta | Texto libre "timeout" en el mensaje; calcula score. |
+| `filter` | filtro | Servicio, nivel y día exactos. |
+| `must_not` | filtro | Excluye el servidor de pruebas, que contamina las métricas de producción. |
 
-  # Añadir metadatos del pipeline
-  mutate {
-    add_field => {
-      "[event][dataset]" => "java_app.logs"
-      "[event][module]" => "custom"
-      "[@metadata][target_index]" => "labs-logstash-app-%{+YYYY.MM.dd}"
-    }
-  }
+`track_total_hits: true` obliga a contar exactamente; sin él, el total
+es exacto solo hasta 10 000. Las fechas incluyen `-06:00` para que el
+día sea el día **local**.
 
-  # Limpiar campos temporales
-  mutate {
-    remove_field => ["raw_timestamp", "raw_first_line", "raw_context", "host", "path"]
+**Resultado esperado:** `hits.total.value` = **391**. Sin la cláusula
+`must_not`, el total sube a 406: el host `test-01` generó 15 timeouts
+que no son de producción.
+
+#### Pregunta 5. ¿Cuántos eventos tienen un stack trace?
+
+``` 
+GET logs-mercanova.app-default/_count
+{
+  "query": { "exists": { "field": "error.stack_trace" } }
+}
+```
+
+**Qué hace y por qué:** `exists` encuentra los documentos que tienen un
+valor indexado en el campo. `_count` devuelve solo el número, sin
+documentos ni score: es la forma más barata de contar.
+
+**Resultado esperado:** `count` = **58**, todos del servicio `checkout`
+con la excepción `NullPointerException`.
+
+### Tarea 3. Agregaciones
+
+#### Pregunta 6. ¿Cuánto se vendió en la semana, cuál fue el ticket promedio y cuántos clientes compraron?
+
+``` 
+GET orders/_search
+{
+  "size": 0,
+  "query": { "range": { "@timestamp": {
+    "gte": "2026-10-13T00:00:00-06:00",
+    "lt":  "2026-10-20T00:00:00-06:00" } } },
+  "aggs": {
+    "ventas":   { "sum": { "field": "total" } },
+    "ticket":   { "avg": { "field": "total" } },
+    "clientes": { "cardinality": { "field": "customer.id" } },
+    "resumen":  { "stats": { "field": "total" } }
   }
 }
-
-output {
-  elasticsearch {
-    hosts => ["https://es01:9200"]
-    index => "%{[@metadata][target_index]}"
-    user => "elastic"
-    password => "ElasticLabs2024!"
-    ssl_enabled => true
-    ssl_certificate_authorities => ["/usr/share/logstash/config/certs/ca/ca.crt"]
-    template_name => "labs-logstash-template"
-    manage_template => false
-  }
-
-  # Output de depuración - descomentar para troubleshooting
-  # stdout { codec => rubydebug }
-}
-PIPELINE
 ```
 
-3. Verifica la sintaxis del archivo:
-
-```bash
-grep -c "^}" ~/elastic-labs/config/logstash/pipeline/labs-app-pipeline.conf
-```
-
-**Resultado esperado:** `3` (cierre de los bloques input, filter y output).
-
-**Verificación:** El archivo contiene las tres secciones principales (input, filter, output) con todos los plugins configurados.
-
----
-
-### Paso 4: Configurar Logstash con Dead Letter Queue habilitada
-
-**Objetivo:** Crear la configuración de Logstash que habilita la DLQ para capturar eventos que fallan en el output.
-
-**Instrucciones:**
-
-1. Crea el archivo `logstash.yml`:
-
-```bash
-cat > ~/elastic-labs/config/logstash/logstash.yml << 'EOF'
-# Configuración principal de Logstash
-http.host: "0.0.0.0"
-http.port: 9600
-
-# Dead Letter Queue - captura eventos que fallan en el output
-dead_letter_queue.enable: true
-dead_letter_queue.max_bytes: 1024mb
-dead_letter_queue.storage_policy: drop_newer
-dead_letter_queue.retain.age: 7d
-
-# Configuración de pipeline
-pipeline.workers: 2
-pipeline.batch.size: 125
-pipeline.batch.delay: 50
-
-# Logging
-log.level: info
-
-# Monitoreo
-xpack.monitoring.enabled: false
-EOF
-```
-
-2. Crea el archivo `pipelines.yml`:
-
-```bash
-cat > ~/elastic-labs/config/logstash/pipelines.yml << 'EOF'
-- pipeline.id: labs-app
-  path.config: "/usr/share/logstash/pipeline/labs-app-pipeline.conf"
-  pipeline.workers: 2
-  dead_letter_queue.enable: true
-EOF
-```
-
-**Resultado esperado:** Dos archivos de configuración creados sin errores.
-
----
-
-### Paso 5: Configurar y lanzar el contenedor de Logstash
-
-**Objetivo:** Crear el servicio de Logstash en Docker Compose y ejecutarlo.
-
-**Instrucciones:**
-
-1. Crea un archivo Docker Compose específico para Logstash (para no alterar el compose principal):
-
-```bash
-cat > ~/elastic-labs/docker-compose-logstash.yml << 'EOF'
-version: "3.8"
-
-services:
-  logstash01:
-    image: docker.elastic.co/logstash/logstash:8.14.1
-    container_name: logstash01
-    hostname: logstash01
-    environment:
-      - XPACK_MONITORING_ENABLED=false
-      - LS_JAVA_OPTS=-Xms1g -Xmx1g
-    volumes:
-      - ./config/logstash/pipeline/labs-app-pipeline.conf:/usr/share/logstash/pipeline/labs-app-pipeline.conf:ro
-      - ./config/logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
-      - ./config/logstash/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
-      - ./config/logstash/dictionaries:/usr/share/logstash/config/dictionaries:ro
-      - ./logs/logstash-input/java_exception.log:/var/log/app/java_exception.log:ro
-      - ./config/certs:/usr/share/logstash/config/certs:ro
-      - logstash_data:/usr/share/logstash/data
-    networks:
-      - elastic-net
-    depends_on:
-      - es01
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9600/_node/stats | grep -q '\"status\":\"green\"' || curl -s http://localhost:9600 | grep -q 'logstash'"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
-volumes:
-  logstash_data:
-    driver: local
-
-networks:
-  elastic-net:
-    external: true
-EOF
-```
-
-2. Verifica que la red Docker `elastic-net` existe:
-
-```bash
-docker network ls | grep elastic-net
-```
-
-Si no existe, créala:
-
-```bash
-docker network create --subnet=172.20.0.0/24 elastic-net
-```
-
-3. Verifica que los certificados están disponibles:
-
-```bash
-ls ~/elastic-labs/config/certs/ca/ca.crt
-```
-
-Si el archivo no existe, copia los certificados del contenedor de Elasticsearch:
-
-```bash
-mkdir -p ~/elastic-labs/config/certs/ca
-docker cp es01:/usr/share/elasticsearch/config/certs/ca/ca.crt ~/elastic-labs/config/certs/ca/ca.crt
-```
-
-4. Lanza el contenedor de Logstash:
-
-```bash
-cd ~/elastic-labs
-docker compose -f docker-compose-logstash.yml up -d logstash01
-```
-
-5. Observa los logs en tiempo real (espera ~30 segundos para que Logstash inicie):
-
-```bash
-docker logs -f logstash01 2>&1 | head -80
-```
-
-**Resultado esperado:** Después de 20-40 segundos verás mensajes como:
-```
-[INFO ] Pipelines running {:count=>1, :running_pipelines=>[:labs-app], :non_running_pipelines=>[]}
-[INFO ] Successfully started Logstash API endpoint {:port=>9600, :ssl_enabled=>false}
-```
-
-**Verificación:**
-
-```bash
-docker exec logstash01 curl -s http://localhost:9600/_node/pipelines?pretty | jq '.pipelines["labs-app"].status'
-```
-
-Debe devolver `"running"`.
-
----
-
-### Paso 6: Verificar la indexación en Elasticsearch
-
-**Objetivo:** Confirmar que los eventos se procesaron correctamente y se indexaron en Elasticsearch.
-
-**Instrucciones:**
-
-1. Espera 15 segundos tras ver el pipeline activo, luego verifica los índices:
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-logstash-app-*?v&h=index,docs.count,store.size"
-```
+**Qué hace y por qué:** `size: 0` evita devolver documentos: solo
+interesan los indicadores. `cardinality` cuenta valores distintos con el
+algoritmo HyperLogLog++; con menos de 3 000 valores, su umbral de
+precisión por defecto, el resultado es exacto. `stats` devuelve en una
+sola agregación count, min, max, avg y sum.
 
 **Resultado esperado:**
-```
-index                           docs.count store.size
-labs-logstash-app-2024.06.15          7       45kb
-```
 
-2. Consulta un documento para verificar la estructura ECS:
+| Indicador | Valor |
+|--------------------------------|----------------------------|
+| Ventas | 2 757 342.07 |
+| Ticket promedio | 1 531.86 |
+| Clientes únicos | 570 |
+| Pedidos (count) | 1 800 |
 
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_search?size=1&q=log.level:error" | jq '.hits.hits[0]._source | {log, error, source, event_context, "event.dataset": .event.dataset}'
-```
+#### Pregunta 7. ¿Cuántos pedidos y cuántas ventas hubo por región?
 
-**Resultado esperado:** Un documento con campos ECS correctamente mapeados:
-```json
+``` 
+GET orders/_search
 {
-  "log": {
-    "level": "error",
-    "logger": "com.labs.service.PaymentService"
-  },
-  "error": {
-    "code": "PAY_001",
-    "type": "java.lang.NullPointerException",
-    "message": "Cannot invoke method on null object",
-    "description": "Payment gateway timeout or rejection",
-    "stack_trace": "..."
-  },
-  "source": {
-    "ip": "203.0.113.45",
-    "geo": { ... }
-  },
-  "event_context": {
-    "transaction_id": "txn-7890",
-    "amount": 150.0,
-    "currency": "USD"
-  },
-  "event.dataset": "java_app.logs"
-}
-```
-
-3. Verifica el conteo por nivel de log:
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_search" -H 'Content-Type: application/json' -d '{
   "size": 0,
   "aggs": {
-    "by_level": {
-      "terms": { "field": "log.level" }
+    "region": {
+      "terms": { "field": "customer.region", "size": 10 },
+      "aggs": { "ventas": { "sum": { "field": "total" } } }
     }
   }
-}' | jq '.aggregations.by_level.buckets'
+}
 ```
+
+**Qué hace y por qué:** `terms` crea un bucket por cada valor de
+`customer.region`, ordenado por número de documentos. La subagregación
+`sum` se calcula **dentro** de cada bucket. Como el índice tiene un solo
+shard, los conteos de `terms` son exactos (`doc_count_error_upper_bound:
+0`).
+
+**Resultado esperado:** centro 590 pedidos, norte 540, occidente 415 y
+sur 255.
+
+#### Pregunta 8. ¿Cómo evolucionaron las ventas por día, cuál es el acumulado y cuál fue el mejor día?
+
+``` 
+GET orders/_search
+{
+  "size": 0,
+  "aggs": {
+    "por_dia": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "calendar_interval": "day",
+        "time_zone": "America/Mexico_City"
+      },
+      "aggs": {
+        "ventas":    { "sum": { "field": "total" } },
+        "acumulado": { "cumulative_sum":
+                       { "buckets_path": "ventas" } }
+      }
+    },
+    "mejor_dia": { "max_bucket":
+                   { "buckets_path": "por_dia>ventas" } }
+  }
+}
+```
+
+**Qué hace y por qué:** `calendar_interval: day` respeta días de
+calendario; `time_zone` los corta a medianoche **local**. Sin
+`time_zone`, los días se cortarían a medianoche UTC (6:00 p. m. en
+México) y las ventas se repartirían mal. `cumulative_sum` y `max_bucket`
+son agregaciones **pipeline**: operan sobre los resultados de otras
+agregaciones, indicadas con `buckets_path` (`>` entra a una
+subagregación).
 
 **Resultado esperado:**
-```json
-[
-  { "key": "error", "doc_count": 4 },
-  { "key": "warn", "doc_count": 2 },
-  { "key": "info", "doc_count": 1 }
-]
+
+| Día | Ventas | Acumulado |
+|------------------|---------------------|---------------------|
+| 2026-10-13 | 300 916.14 | 300 916.14 |
+| 2026-10-14 | 355 811.48 | 656 727.62 |
+| 2026-10-15 | 379 780.90 | 1 036 508.52 |
+| 2026-10-16 | 380 847.65 | 1 417 356.17 |
+| 2026-10-17 | 424 494.26 | 1 841 850.43 |
+| 2026-10-18 | 488 841.44 | 2 330 691.87 |
+| 2026-10-19 | 426 650.20 | 2 757 342.07 |
+
+`mejor_dia`: **2026-10-18** con 488 841.44.
+
+#### Pregunta 9. ¿Qué rutas generaron errores 5xx?
+
+``` 
+GET logs-mercanova.app-default/_search
+{
+  "size": 0,
+  "query": { "range": {
+    "http.response.status_code": { "gte": 500 } } },
+  "aggs": {
+    "rutas": { "terms": { "field": "url.path", "size": 5 } }
+  }
+}
 ```
 
-**Verificación:** 7 documentos indexados con 4 errores, 2 warnings y 1 info.
+**Qué hace y por qué:** el `range` sobre un campo numérico
+(`short`) filtra los códigos 500 a 599, y `terms` agrupa por la ruta.
+Como `url.path` es `keyword`, cada ruta es un valor exacto.
 
----
+**Resultado esperado:** `/api/payment/charge` 412,
+`/api/checkout` 97, `/api/cart/items` 10 y `/api/cart` 5 (total 524).
 
-### Paso 7: Introducir un error intencional y depurar con logs de Logstash
+#### Pregunta 10. ¿Cuál es la latencia p95 de cada servicio?
 
-**Objetivo:** Practicar la depuración de errores de parsing modificando el pipeline para provocar un fallo y corregirlo.
-
-**Instrucciones:**
-
-1. Detén Logstash:
-
-```bash
-docker compose -f docker-compose-logstash.yml down logstash01
-```
-
-2. Elimina el índice existente para reprocesar:
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  -X DELETE "https://localhost:9200/labs-logstash-app-*"
-```
-
-3. Introduce un error en el patrón grok (cambia `TIMESTAMP_ISO8601` por un patrón incorrecto):
-
-```bash
-sed -i 's/TIMESTAMP_ISO8601:raw_timestamp/TIMESTAMP_ISO8601_INVALID:raw_timestamp/' \
-  ~/elastic-labs/config/logstash/pipeline/labs-app-pipeline.conf
-```
-
-4. Relanza Logstash:
-
-```bash
-docker compose -f docker-compose-logstash.yml up -d logstash01
-```
-
-5. Observa los logs para detectar el error:
-
-```bash
-sleep 30
-docker logs logstash01 2>&1 | grep -i "error\|failure\|_grokparsefailure" | tail -20
-```
-
-**Resultado esperado:** Verás mensajes indicando que el patrón no se puede compilar o que los eventos reciben la etiqueta `_grokparsefailure`:
-```
-[ERROR] ... Unknown pattern: TIMESTAMP_ISO8601_INVALID
-```
-o bien el pipeline no arranca y muestra un error de configuración.
-
-6. Corrige el error:
-
-```bash
-sed -i 's/TIMESTAMP_ISO8601_INVALID:raw_timestamp/TIMESTAMP_ISO8601:raw_timestamp/' \
-  ~/elastic-labs/config/logstash/pipeline/labs-app-pipeline.conf
-```
-
-7. Reinicia Logstash:
-
-```bash
-docker compose -f docker-compose-logstash.yml restart logstash01
-```
-
-8. Verifica que los eventos se procesan correctamente:
-
-```bash
-sleep 30
-curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-logstash-app-*?v&h=index,docs.count"
-```
-
-**Resultado esperado:** El índice debe mostrar 7 documentos nuevamente.
-
-**Verificación:** El pipeline se recupera tras corregir el patrón grok y los documentos se indexan sin tags de error.
-
----
-
-### Paso 8: Probar la Dead Letter Queue con un error de mapping
-
-**Objetivo:** Provocar un error en el output que active la DLQ y verificar que los eventos fallidos se capturan.
-
-**Instrucciones:**
-
-1. Detén Logstash y elimina los índices:
-
-```bash
-docker compose -f docker-compose-logstash.yml down logstash01
-curl -s -k -u elastic:ElasticLabs2024! \
-  -X DELETE "https://localhost:9200/labs-logstash-app-*"
-```
-
-2. Crea un mapping conflictivo en el índice destino (forzar que `log.level` sea de tipo `integer` cuando Logstash enviará un string):
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  -X PUT "https://localhost:9200/labs-logstash-app-2024.06.15" \
-  -H 'Content-Type: application/json' -d '{
-  "mappings": {
-    "properties": {
-      "log": {
-        "properties": {
-          "level": { "type": "integer" }
-        }
+``` 
+GET logs-mercanova.app-default/_search
+{
+  "size": 0,
+  "aggs": {
+    "servicio": {
+      "terms": { "field": "service.name" },
+      "aggs": {
+        "p95": { "percentiles": {
+          "field": "duration_ms", "percents": [ 50, 95 ] } }
       }
     }
   }
-}'
+}
 ```
 
-3. Relanza Logstash:
+**Qué hace y por qué:** el **p95** es el valor por debajo del cual está
+el 95 % de las peticiones: describe la experiencia de los usuarios más
+afectados mejor que el promedio, que oculta los casos lentos.
+`percentiles` usa el algoritmo TDigest, que es aproximado; tus valores
+pueden variar unas décimas.
 
-```bash
-docker compose -f docker-compose-logstash.yml up -d logstash01
+**Resultado esperado (aproximado):**
+
+| Servicio | p95 (ms) |
+|------------------------------|------------------------------|
+| catalog | ≈ 210 |
+| auth | ≈ 266 |
+| cart | ≈ 280 |
+| checkout | ≈ 657 |
+| payment | 30 000 |
+
+El p95 de payment es 30 000 ms porque casi 20 % de sus eventos son
+timeouts de 30 segundos. Es un hallazgo: el promedio no lo mostraría
+con esta claridad.
+
+#### Pregunta 11. ¿En qué horas se concentran los errores de payment?
+
+``` 
+GET logs-mercanova.app-default/_search
+{
+  "size": 0,
+  "query": { "bool": { "filter": [
+    { "term": { "service.name": "payment" } },
+    { "term": { "log.level": "error" } } ] } },
+  "aggs": {
+    "por_hora": {
+      "date_histogram": {
+        "field": "@timestamp",
+        "fixed_interval": "1h",
+        "time_zone": "America/Mexico_City",
+        "min_doc_count": 1
+      },
+      "aggs": {
+        "top3": { "bucket_sort": {
+          "sort": [ { "_count": { "order": "desc" } } ],
+          "size": 3 } }
+      }
+    }
+  }
+}
 ```
 
-4. Espera 40 segundos y verifica los logs de error:
+**Qué hace y por qué:** `fixed_interval: 1h` crea un bucket por hora;
+`min_doc_count: 1` omite las horas sin errores. `bucket_sort` es una
+agregación pipeline que reordena los buckets por conteo y conserva solo
+los tres primeros.
 
-```bash
-sleep 40
-docker logs logstash01 2>&1 | grep -i "mapper_parsing_exception\|DLQ\|dead_letter" | tail -10
+**Resultado esperado:** 14:00 → **318**, 15:00 → 41 y 13:00 → 12 (hora
+local). Primer hallazgo del caso: algo pasó con payment entre las 14:00
+y las 15:00.
+
+### Tarea 4. ES|QL
+
+#### Pregunta 12. ¿Cuántos errores tuvo cada servicio? (con ES\|QL)
+
+``` 
+POST _query?format=txt
+{
+  "query": """
+    FROM logs-mercanova.app-*
+    | WHERE log.level == "error"
+    | STATS errores = COUNT(*) BY service.name
+    | SORT errores DESC
+  """
+}
 ```
 
-**Resultado esperado:** Mensajes indicando errores de mapping y eventos enviados a la DLQ:
-```
-[WARN ] ... response=>{"index"=>{"error"=>{"type"=>"mapper_parsing_exception"...}}}
-```
+**Qué hace y por qué:** cada comando procesa la salida del anterior:
+`FROM` lee el origen, `WHERE` filtra, `STATS … BY` agrupa y `SORT`
+ordena. `format=txt` devuelve una tabla legible; las triples comillas
+`"""` permiten escribir la consulta en varias líneas dentro del JSON.
 
-5. Verifica que la DLQ tiene eventos:
+**Resultado esperado:**
 
-```bash
-docker exec logstash01 find /usr/share/logstash/data/dead_letter_queue -name "*.log" -exec ls -la {} \;
-```
-
-**Resultado esperado:** Uno o más archivos `.log` en el directorio de la DLQ con tamaño > 0.
-
-6. Limpia el índice con mapping incorrecto y recrea correctamente:
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  -X DELETE "https://localhost:9200/labs-logstash-app-2024.06.15"
+``` 
+    errores    | service.name
+---------------+---------------
+412            |payment
+97             |checkout
+15             |cart
 ```
 
-7. Reinicia Logstash para reprocesar (como usamos `sincedb_path => "/dev/null"`, releerá el archivo):
+#### Pregunta 13. ¿Cuáles son las advertencias más frecuentes y en qué hora UTC ocurrió el pico de payment?
 
-```bash
-docker compose -f docker-compose-logstash.yml restart logstash01
+``` 
+POST _query?format=txt
+{
+  "query": """
+    FROM logs-mercanova.app-*
+    | WHERE log.level == "warn"
+    | STATS total = COUNT(*) BY service.name, message
+    | SORT total DESC
+    | LIMIT 3
+  """
+}
+
+POST _query?format=txt
+{
+  "query": """
+    FROM logs-mercanova.app-*
+    | WHERE service.name == "payment" AND log.level == "error"
+    | EVAL hora = DATE_TRUNC(1 hour, @timestamp)
+    | STATS errores = COUNT(*) BY hora
+    | SORT errores DESC
+    | LIMIT 1
+  """
+}
 ```
 
-8. Verifica la indexación correcta:
+**Qué hace y por qué:** la primera consulta agrupa por **dos** columnas.
+La segunda usa `EVAL` para crear la columna `hora` con `DATE_TRUNC`.
+Observa que ES\|QL trabaja en **UTC**: el pico aparece como
+`2026-10-19T20:00:00.000Z`, que son las 14:00 en la Ciudad de México.
+Kibana convierte la hora a la zona del navegador al mostrarla.
 
-```bash
-sleep 30
-curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_count" | jq '.count'
+**Resultado esperado:** *Item not found* (catalog) 206,
+*Cart item out of stock* (cart) 132 y *Card declined by issuer*
+(payment) 95. El pico de payment: 318 errores a las
+`2026-10-19T20:00:00.000Z`.
+
+#### Pregunta 14. Exporta a CSV los errores por servicio
+
+``` 
+$ Q='FROM logs-mercanova.app-* | WHERE log.level == ?nivel'
+$ Q="$Q | STATS errores = COUNT(*) BY service.name"
+$ Q="$Q | SORT errores DESC"
+$ jq -n --arg q "$Q" '{query: $q, params: [ {nivel: "error"} ]}' \
+      > /tmp/errores.json
+$ curl -s --cacert $CA -u elastic:$ELASTIC_PWD \
+      -H "Content-Type: application/json" \
+      "$ES/_query?format=csv" --data-binary @/tmp/errores.json \
+      > errores.csv
+$ cat errores.csv
+errores,service.name
+412,payment
+97,checkout
+15,cart
 ```
 
-**Resultado esperado:** `7`
+**Qué hace y por qué:** la consulta se arma en la variable `Q` por
+partes y `jq` construye un JSON válido, sin problemas de comillas.
+`format=csv` entrega el resultado listo para una hoja de cálculo. `?nivel` es un **parámetro con nombre**: su valor llega
+aparte en `params`, igual que en una consulta SQL preparada. Así no se
+arma la consulta concatenando texto, que es propenso a errores e
+inyecciones.
 
-**Verificación:** La DLQ capturó los eventos fallidos y tras corregir el mapping, el reprocesamiento fue exitoso.
+### Tarea 5. Paginación profunda
 
----
+#### Pregunta 15. Recorre los 12 500 eventos en páginas de 5 000
 
-### Paso 9: Validar campos ECS y enriquecimiento completo en Kibana
+Primero comprueba el límite de `from` + `size`:
 
-**Objetivo:** Verificar visualmente en Kibana que todos los campos están correctamente mapeados y enriquecidos.
-
-**Instrucciones:**
-
-1. Accede a Kibana en `https://localhost:5601` con las credenciales `elastic` / `ElasticLabs2024!`.
-
-2. Navega a **Management → Stack Management → Data Views** y crea un nuevo Data View:
-   - Name: `labs-logstash-app-*`
-   - Index pattern: `labs-logstash-app-*`
-   - Timestamp field: `@timestamp`
-
-3. Navega a **Discover** y selecciona el data view `labs-logstash-app-*`.
-
-4. Verifica que los siguientes campos existen en la lista de campos disponibles:
-   - `log.level`
-   - `log.logger`
-   - `error.code`
-   - `error.type`
-   - `error.message`
-   - `error.description`
-   - `error.stack_trace`
-   - `source.ip`
-   - `source.geo.country_name` (puede estar vacío para IPs privadas/reservadas)
-   - `event_context.transaction_id`
-   - `event.dataset`
-
-5. Filtra por `log.level: error` y expande un documento para verificar que el stack trace se capturó completo.
-
-6. Verifica el campo `error.description` traducido desde el diccionario CSV.
-
-**Resultado esperado:** Los 7 documentos aparecen con todos los campos ECS correctamente poblados. Los eventos ERROR tienen `error.stack_trace` con las líneas de la excepción Java.
-
-**Verificación mediante API:**
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_search" -H 'Content-Type: application/json' -d '{
-  "size": 1,
-  "query": { "term": { "error.code": "PAY_001" } },
-  "_source": ["log.level", "log.logger", "error", "source.ip", "event.dataset", "message_parsed"]
-}' | jq '.hits.hits[0]._source'
+``` 
+GET logs-mercanova.app-default/_search
+{ "from": 10000, "size": 100 }
 ```
 
----
+**Qué hace y por qué:** falla con
+`Result window is too large, from + size must be less than or equal
+to: [10000]`. El límite `index.max_result_window` protege la memoria:
+para devolver la posición 10 000, cada shard tendría que ordenar 10 100
+documentos.
 
-## Validación y Pruebas
+Abre un PIT y pide la primera página:
 
-Ejecuta las siguientes verificaciones para confirmar que la práctica se completó exitosamente:
+``` 
+POST logs-mercanova.app-default/_pit?keep_alive=2m
 
-### Test 1: Conteo de documentos
-
-```bash
-DOCS=$(curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_count" | jq '.count')
-echo "Documentos indexados: $DOCS"
-[ "$DOCS" -eq 7 ] && echo "✅ PASS: 7 documentos indexados" || echo "❌ FAIL: Se esperaban 7 documentos"
+GET _search
+{
+  "size": 5000,
+  "pit": { "id": "<ID_DEL_PIT>", "keep_alive": "2m" },
+  "sort": [ { "@timestamp": "asc" }, { "_shard_doc": "asc" } ],
+  "_source": false
+}
 ```
 
-### Test 2: Campos ECS presentes
+Para la página siguiente, copia el arreglo `sort` del **último** hit en
+`search_after` (y usa el `pit.id` que devuelve cada respuesta):
 
-```bash
-FIELDS=$(curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_mapping" | jq '[.. | objects | keys[]] | unique | map(select(. == "level" or . == "logger" or . == "stack_trace" or . == "dataset")) | length')
-echo "Campos ECS encontrados: $FIELDS"
-[ "$FIELDS" -ge 4 ] && echo "✅ PASS: Campos ECS presentes" || echo "❌ FAIL: Faltan campos ECS"
+``` 
+GET _search
+{
+  "size": 5000,
+  "pit": { "id": "<ID_DEL_PIT>", "keep_alive": "2m" },
+  "sort": [ { "@timestamp": "asc" }, { "_shard_doc": "asc" } ],
+  "search_after": [ 1760889830123, 4999 ],
+  "_source": false
+}
+
+DELETE _pit
+{ "id": "<ID_DEL_PIT>" }
 ```
 
-### Test 3: Plugin translate funcionando
+**Qué hace y por qué:**
 
-```bash
-TRANSLATED=$(curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_search?q=error.description:*gateway*" | jq '.hits.total.value')
-echo "Documentos con traducción 'gateway': $TRANSLATED"
-[ "$TRANSLATED" -ge 1 ] && echo "✅ PASS: Plugin translate funcional" || echo "❌ FAIL: Translate no aplicó"
-```
+| Elemento | Función |
+|---------------|---------------------------------------------|
+| `_pit` | Congela una vista consistente de los datos: documentos nuevos o borrados no alteran la paginación. |
+| `keep_alive` | Tiempo que el PIT sigue vivo entre página y página; se renueva en cada petición. |
+| `_shard_doc` | Desempate único y eficiente para el orden. |
+| `search_after` | Continúa justo después del último documento, sin importar cuántas páginas haya. |
+| `DELETE _pit` | Libera los recursos al terminar. |
 
-### Test 4: Multiline correcto (stack traces agrupados)
+**Resultado esperado:** tres páginas de 5 000, 5 000 y 2 500 eventos; la
+cuarta llega vacía. Los valores de `search_after` serán distintos a los
+del ejemplo.
 
-```bash
-STACK=$(curl -s -k -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_search" -H 'Content-Type: application/json' -d '{
-  "size": 1,
-  "query": { "exists": { "field": "error.stack_trace" } },
-  "_source": ["error.stack_trace"]
-}' | jq -r '.hits.hits[0]._source.error.stack_trace' | grep -c "at ")
-echo "Líneas 'at' en stack_trace: $STACK"
-[ "$STACK" -ge 2 ] && echo "✅ PASS: Multiline agrupó stack traces" || echo "❌ FAIL: Stack traces no agrupados"
-```
+### Resultado esperado
 
-### Test 5: Pipeline de Logstash activo
+-   15 consultas guardadas en Dev Tools con resultados iguales a los de
+    la guía (los percentiles pueden variar ligeramente).
+-   Archivo `errores.csv` exportado con ES\|QL.
+-   Hallazgo del caso para la reunión: **los timeouts de payment se
+    concentran entre las 14:00 y las 15:00 del 19 de octubre** (318
+    errores), con un p95 de 30 segundos; el mejor día de ventas fue el
+    18 de octubre.
+-   Puedes explicar cuándo usar `filter` y cuándo `must`, por qué las
+    agregaciones de fecha necesitan `time_zone` y por qué se pagina con
+    PIT y no con `from`.
 
-```bash
-STATUS=$(docker exec logstash01 curl -s http://localhost:9600/_node/pipelines | jq -r '.pipelines["labs-app"].status')
-echo "Estado del pipeline: $STATUS"
-[ "$STATUS" = "running" ] && echo "✅ PASS: Pipeline activo" || echo "❌ FAIL: Pipeline no está running"
-```
+### Referencias
 
----
-
-## Solución de Problemas
-
-### Problema 1: Logstash no arranca — error "Unknown pattern" en grok
-
-**Síntomas:**
-- El contenedor se reinicia continuamente o se detiene inmediatamente
-- Los logs muestran: `[ERROR] Configuration has a syntax error... Unknown pattern: XXXX`
-- `docker ps` muestra el contenedor en estado `Restarting`
-
-**Causa:** Se ha utilizado un nombre de patrón grok que no existe en la biblioteca estándar de Logstash. Los nombres de patrones son case-sensitive y deben coincidir exactamente con los definidos en `/usr/share/logstash/vendor/bundle/jruby/*/gems/logstash-patterns-core-*/patterns/`.
-
-**Solución:**
-
-```bash
-# 1. Verificar el error exacto en los logs
-docker logs logstash01 2>&1 | grep -i "unknown pattern\|syntax error"
-
-# 2. Listar patrones disponibles para referencia
-docker exec logstash01 find /usr/share/logstash/vendor/bundle -name "grok-patterns" -exec head -50 {} \;
-
-# 3. Corregir el patrón en el archivo de configuración
-# Los patrones comunes correctos son: TIMESTAMP_ISO8601, LOGLEVEL, JAVACLASS, IP, GREEDYDATA, DATA, WORD
-nano ~/elastic-labs/config/logstash/pipeline/labs-app-pipeline.conf
-
-# 4. Reiniciar Logstash
-docker compose -f docker-compose-logstash.yml restart logstash01
-```
-
----
-
-### Problema 2: Documentos indexados con tag `_grokparsefailure` — campos no extraídos
-
-**Síntomas:**
-- Los documentos aparecen en Elasticsearch pero solo contienen `message` y `tags: ["_grokparsefailure"]`
-- Los campos `log.level`, `log.logger`, `source.ip` no existen en los documentos
-- En Kibana Discover, el campo `message` muestra el log completo sin parsear
-
-**Causa:** El patrón grok no coincide con el formato real del log. Esto ocurre frecuentemente cuando el codec multiline altera el contenido del campo `message` (por ejemplo, añadiendo `\n` entre líneas) o cuando hay diferencias sutiles en espaciado/separadores.
-
-**Solución:**
-
-```bash
-# 1. Habilitar stdout para ver el contenido real del campo message
-# Editar el pipeline y descomentar el output stdout:
-sed -i 's/# stdout { codec => rubydebug }/stdout { codec => rubydebug }/' \
-  ~/elastic-labs/config/logstash/pipeline/labs-app-pipeline.conf
-
-# 2. Reiniciar y observar la salida
-docker compose -f docker-compose-logstash.yml restart logstash01
-sleep 30
-docker logs logstash01 2>&1 | grep -A 5 '"message"'
-
-# 3. Copiar el valor exacto del campo message y probarlo en el Grok Debugger de Kibana:
-#    Kibana → Dev Tools → Grok Debugger
-#    Pegar el mensaje y ajustar el patrón hasta que coincida
-
-# 4. Problema común: el multiline añade \n literal que debe manejarse
-#    Solución: anclar el patrón grok al inicio con ^ y usar (?m) si es necesario
-#    O asegurarse de que el patrón grok solo procese la primera línea
-
-# 5. Una vez corregido, volver a comentar stdout y reiniciar
-sed -i 's/stdout { codec => rubydebug }/# stdout { codec => rubydebug }/' \
-  ~/elastic-labs/config/logstash/pipeline/labs-app-pipeline.conf
-docker compose -f docker-compose-logstash.yml restart logstash01
-```
-
----
-
-## Limpieza
-
-Ejecuta los siguientes comandos para liberar recursos al finalizar la práctica:
-
-```bash
-# Detener el contenedor de Logstash
-cd ~/elastic-labs
-docker compose -f docker-compose-logstash.yml down
-
-# Eliminar el volumen de datos de Logstash (incluye DLQ)
-docker volume rm elastic-labs_logstash_data 2>/dev/null || true
-
-# (OPCIONAL) Eliminar los índices de esta práctica si no necesitas los datos para Práctica 5
-# NOTA: NO ejecutar si vas a continuar con Práctica 5
-# curl -s -k -u elastic:ElasticLabs2024! -X DELETE "https://localhost:9200/labs-logstash-app-*"
-
-# Los archivos de configuración se mantienen en ~/elastic-labs/config/logstash/
-# para referencia y uso en prácticas posteriores
-echo "Limpieza completada. Archivos de configuración preservados en ~/elastic-labs/config/logstash/"
-```
-
-> **⚠️ Importante:** No elimines los índices `labs-logstash-app-*` si planeas continuar con la Práctica 5, ya que estos datos serán la fuente del dashboard operativo.
-
----
-
-## Resumen
-
-En esta práctica has construido un pipeline de Logstash completo que:
-
-1. **Lee logs multiline** de una aplicación Java usando el codec multiline para agrupar stack traces con sus eventos padre
-2. **Extrae campos estructurados** mediante grok (timestamp, nivel, logger, mensaje, IP, código de error, contexto JSON)
-3. **Parsea JSON embebido** dentro del campo de contexto usando el plugin json
-4. **Normaliza el timestamp** con el plugin date para establecer `@timestamp` correctamente
-5. **Enriquece con geolocalización** las IPs de cliente mediante geoip
-6. **Traduce códigos de error** a descripciones legibles usando un diccionario CSV con translate
-7. **Mapea al estándar ECS** renombrando campos a `log.level`, `log.logger`, `error.type`, `error.message`, `error.stack_trace`, `source.ip`
-8. **Envía a Elasticsearch** con el template e ILM configurados en Práctica 2
-9. **Captura eventos fallidos** en la Dead Letter Queue para diagnóstico
-
-### Conceptos Clave Reforzados
-
-- La arquitectura input → filter → output de Logstash permite construir transformaciones complejas de manera modular
-- El codec multiline es esencial para logs Java con excepciones (el patrón `^TIMESTAMP` con `negate => true` y `what => previous` agrupa líneas de stack trace con el evento anterior)
-- La DLQ es una herramienta fundamental de depuración para errores que ocurren en la fase de output (mapping conflicts, timeouts)
-- Los tags de fallo (`_grokparsefailure`, `_dateparsefailure`, `_jsonparsefailure`) son el primer indicador de problemas en los filtros
-
-### Recursos Adicionales
-
-- [Documentación del codec multiline](https://www.elastic.co/guide/en/logstash/current/plugins-codecs-multiline.html)
-- [Referencia de patrones grok predefinidos](https://github.com/logstash-plugins/logstash-patterns-core/tree/main/patterns)
-- [Grok Debugger en Kibana](https://www.elastic.co/guide/en/kibana/current/xpack-grokdebugger.html)
-- [Configuración de Dead Letter Queue](https://www.elastic.co/guide/en/logstash/current/dead-letter-queues.html)
-- [Elastic Common Schema (ECS) - Field Reference](https://www.elastic.co/guide/en/ecs/current/ecs-field-reference.html)
+-   Elastic. *Query DSL \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/query-dsl.html>
+-   Elastic. *Aggregations \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-aggregations.html>
+-   Elastic. *ES\|QL \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/esql.html>
+-   Elastic. *Paginate search results \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/paginate-search-results.html>
+-   Elastic. *Highlighting \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/highlighting.html>
