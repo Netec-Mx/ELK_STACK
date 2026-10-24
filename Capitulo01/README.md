@@ -1,668 +1,464 @@
-# Identificar los componentes del entorno y validar el flujo de datos de una fuente de logs
+# ELK Stack: Elasticsearch, Logstash y Kibana
 
-## Metadata
+## Práctica 1. Cuestionario de fundamentos de ELK Stack
 
-| Campo | Valor |
-|-------|-------|
-| **Duración** | 34 minutos |
-| **Complejidad** | Fácil |
-| **Nivel Bloom** | Aplicar |
+### Objetivo
 
-## Descripción General
+Al finalizar la práctica, serás capaz de:
 
-En esta práctica inaugural levantarás el entorno completo del Elastic Stack 8.14.1 mediante Docker Compose, inspeccionarás cada componente en ejecución (Elasticsearch, Kibana, Logstash, Fleet Server y Filebeat 7.17.22 legacy), verificarás la salud del clúster a través de la API REST y, finalmente, inyectarás un archivo de logs de muestra de Nginx para observar el flujo completo de datos desde la fuente hasta su visualización en Kibana. Al concluir, el entorno quedará operativo como base para todas las prácticas subsecuentes del curso.
+-   Identificar la función de Elasticsearch, Logstash, Kibana, Beats,
+    Elastic Agent y Fleet dentro del flujo de datos.
+-   Explicar los conceptos de la arquitectura distribuida de
+    Elasticsearch: clúster, nodos, roles, índices, documentos, shards y
+    réplicas.
+-   Interpretar el estado de salud de un clúster y el mecanismo de
+    búsqueda casi en tiempo real.
+-   Distinguir los modelos de despliegue, los niveles de licencia y el
+    ciclo de vida de las versiones 8.x y 9.x.
 
-## Objetivos de Aprendizaje
+### Objetivo visual
 
-- [ ] Identificar y describir el rol de cada componente del Elastic Stack (Elasticsearch, Kibana, Logstash, Beats, Elastic Agent y Fleet Server) observando los contenedores desplegados en el entorno de laboratorio.
-- [ ] Validar que el flujo de datos de una fuente de logs de muestra (nginx_access_sample.log) llega correctamente desde Logstash hasta su indexación en Elasticsearch y visualización en Kibana.
-- [ ] Distinguir las diferencias arquitectónicas entre Filebeat 7.17.22 (legacy) y el modelo de Elastic Agent + Fleet en la versión 8.14.1 mediante observación directa del entorno.
-- [ ] Documentar los puertos, credenciales y nombres de contenedores del entorno para referencia en prácticas posteriores.
+![Mapa de conceptos evaluados en el cuestionario](img/lab01.png){width="6.3in"}\
 
-## Prerrequisitos
+### Duración aproximada
 
-### Conocimientos previos
+-   30 minutos: 15 minutos para responder de forma individual y 15
+    minutos para la revisión grupal.
 
-- Comandos básicos de Linux (navegación de directorios, edición de archivos, lectura de logs).
-- Uso de Docker: `docker ps`, `docker logs`, `docker exec`.
-- Consultas HTTP básicas con `curl`.
-- Concepto general de qué es un índice en Elasticsearch y qué es un pipeline en Logstash.
+### Prerrequisitos
 
-### Acceso requerido
+-   Haber revisado el capítulo 1: *Fundamentos y arquitectura de ELK
+    Stack*.
+-   No se requiere el ambiente de laboratorio.
 
-- Sistema operativo Ubuntu 22.04 LTS con acceso de usuario con privilegios `sudo`.
-- Docker Engine 26.1.4 y Docker Compose 2.27.1 instalados y funcionales.
-- Repositorio del curso clonado en `~/elastic-labs/`.
-- Conexión a Internet para descarga de imágenes Docker (primera ejecución).
-- Puertos 9200, 9300, 5601, 5044, 8080, 8220 libres en el host.
+### Instrucciones
 
-## Entorno de Laboratorio
+**Escenario:** MercaNova, la tienda en línea del caso del curso, quiere
+centralizar sus logs y datos de negocio con ELK Stack. Antes de instalar
+el clúster en la práctica 2, el equipo debe dominar el vocabulario y la
+arquitectura de la plataforma. Este cuestionario verifica esa base y
+sirve también como diagnóstico para el instructor.
 
-### Recursos de hardware mínimos
+1.  Responde las 20 preguntas de forma individual, sin consultar las
+    diapositivas. Cada pregunta tiene **una sola respuesta correcta**.
+2.  Anota tu respuesta en la hoja de respuestas de la Tarea 2.
+3.  Al terminar, el instructor revisa las respuestas con el grupo. Usa
+    el **Apéndice A** para entender por qué cada opción es correcta o
+    incorrecta.
+4.  Identifica los temas en los que fallaste y repásalos antes de la
+    práctica 2: son la base de todo el curso.
 
-| Recurso | Mínimo | Recomendado |
-|---------|--------|-------------|
-| CPU | 4 núcleos | 8 núcleos |
-| RAM | 16 GB | 24 GB |
-| Disco SSD | 60 GB libres | 80 GB libres |
+------------------------------------------------------------------------
 
-### Software del entorno
+### Tarea 1. Responde el cuestionario
 
-| Componente | Versión | Contenedor |
-|------------|---------|------------|
-| Elasticsearch | 8.14.1 | `es01` |
-| Kibana | 8.14.1 | `kibana01` |
-| Logstash | 8.14.1 | `logstash01` |
-| Fleet Server | 8.14.1 | `fleet-server01` |
-| Filebeat (legacy) | 7.17.22 | `filebeat-legacy01` |
-| Red Docker | bridge | `elastic-net` (172.20.0.0/24) |
+#### Sección A. Componentes y flujo de datos
 
-### Credenciales del stack
+**1. ¿Qué componente indexa, almacena y busca los datos?**
 
-| Usuario | Contraseña | Uso |
-|---------|------------|-----|
-| `elastic` | `ElasticLabs2024!` | Administrador de Elasticsearch y Kibana |
-| `kibana_system` | `KibanaLabs2024!` | Comunicación interna Kibana ↔ Elasticsearch |
+-   a\) Logstash
+-   b\) Kibana
+-   c\) Elasticsearch
+-   d\) Filebeat
 
-### Preparación inicial
+**2. ¿Qué componente se usa principalmente para transformar y
+enriquecer eventos mediante filtros?**
 
-Asegúrate de que el repositorio del curso está clonado y actualizado:
+-   a\) Kibana
+-   b\) Logstash
+-   c\) Fleet Server
+-   d\) Metricbeat
 
-```bash
-cd ~
-ls elastic-labs/ || git clone https://github.com/elastic-training/elastic-labs.git elastic-labs
-cd ~/elastic-labs
-git pull origin main
-```
+**3. ¿Por qué se pasó de llamar "ELK" a "Elastic Stack"?**
 
-Verifica que Docker está operativo:
+-   a\) Se eliminó Logstash del producto.
+-   b\) Se agregaron los Beats y todas las piezas se unificaron con la
+    misma versión.
+-   c\) Kibana cambió de nombre.
+-   d\) Se cambió la licencia del software.
 
-```bash
-docker --version
-docker compose version
-```
+**4. ¿Qué administra Fleet?**
 
-**Salida esperada:**
+-   a\) Los índices del clúster.
+-   b\) Los dashboards de Kibana.
+-   c\) Las políticas e integraciones de los Elastic Agents.
+-   d\) Los snapshots.
 
-```
-Docker version 26.1.4, build ...
-Docker Compose version v2.27.1
-```
+**5. ¿Qué agente unificado reemplaza a varios Beats?**
 
----
+-   a\) Logstash
+-   b\) Elastic Agent
+-   c\) Heartbeat
+-   d\) Kibana
 
-## Paso a Paso
+#### Sección B. Arquitectura distribuida de Elasticsearch
 
-### Paso 1: Levantar el entorno con Docker Compose
+**6. En Elasticsearch, un documento es…**
 
-**Objetivo:** Iniciar todos los servicios del Elastic Stack definidos en el archivo `docker-compose.yml` del repositorio y confirmar que los contenedores arrancan sin errores.
+-   a\) Una fila de una tabla SQL.
+-   b\) Un objeto JSON almacenado en un índice.
+-   c\) Un archivo de log en el disco del servidor.
+-   d\) Un shard.
 
-**Instrucciones:**
+**7. ¿Qué es un shard?**
 
-1. Navega al directorio de configuración del laboratorio:
+-   a\) Una copia de seguridad del índice.
+-   b\) Una partición de un índice; cada shard es un índice de Lucene.
+-   c\) Un nodo del clúster.
+-   d\) Un tipo de campo del mapping.
 
-```bash
-cd ~/elastic-labs/config
-```
+**8. ¿Dónde NUNCA se ubica una réplica?**
 
-2. Inicia los servicios en modo *detached*:
+-   a\) En un nodo de datos.
+-   b\) En el mismo nodo que su shard primario.
+-   c\) En un nodo warm.
+-   d\) En otro nodo del clúster.
 
-```bash
-docker compose up -d
-```
+**9. ¿Qué indica un clúster en estado yellow?**
 
-3. Espera aproximadamente 60–90 segundos para que Elasticsearch complete su inicialización (generación de certificados TLS, creación de usuarios internos). Monitorea el progreso:
+-   a\) Todos los shards están asignados.
+-   b\) Algún shard primario no está asignado.
+-   c\) Todos los primarios están asignados, pero alguna réplica no.
+-   d\) El clúster está apagado.
 
-```bash
-docker compose logs -f es01 --since 1m
-```
+**10. ¿Cuántos nodos elegibles como master se recomiendan, como mínimo,
+para tolerar la caída de uno?**
 
-Presiona `Ctrl+C` cuando veas la línea que indica que el nodo está listo:
+-   a\) 1
+-   b\) 2
+-   c\) 3
+-   d\) 4
 
-```
-"message": "started ..."
-```
+**11. ¿Qué rol de nodo ejecuta los ingest pipelines?**
 
-4. Verifica que todos los contenedores están en estado `running`:
+-   a\) `master`
+-   b\) `ingest`
+-   c\) `ml`
+-   d\) `transform`
 
-```bash
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-```
+**12. Un nodo configurado con `node.roles: [ ]` actúa como…**
 
-**Salida esperada:**
+-   a\) Nodo master dedicado.
+-   b\) Nodo de solo coordinación.
+-   c\) Nodo de datos frozen.
+-   d\) Nodo inválido: Elasticsearch no arranca.
 
-```
-NAMES               STATUS          PORTS
-es01                Up X minutes    0.0.0.0:9200->9200/tcp, 0.0.0.0:9300->9300/tcp
-kibana01            Up X minutes    0.0.0.0:5601->5601/tcp
-logstash01          Up X minutes    0.0.0.0:5044->5044/tcp, 0.0.0.0:8080->8080/tcp
-fleet-server01      Up X minutes    0.0.0.0:8220->8220/tcp
-filebeat-legacy01   Up X minutes    
-```
+#### Sección C. Indexación y búsqueda
 
-**Verificación:** Los cinco contenedores deben aparecer con estado `Up`. Si alguno muestra `Restarting` o `Exited`, revisa sus logs con `docker logs <nombre_contenedor>`.
+**13. ¿Qué estructura permite encontrar rápidamente los documentos que
+contienen un término?**
 
----
+-   a\) El translog.
+-   b\) El índice invertido.
+-   c\) El mapping.
+-   d\) El snapshot.
 
-### Paso 2: Verificar la salud del clúster de Elasticsearch
+**14. ¿Por qué se dice que la búsqueda es "casi en tiempo real"?**
 
-**Objetivo:** Confirmar que el clúster de Elasticsearch está operativo y responde a consultas mediante la API REST, utilizando autenticación y TLS.
+-   a\) Porque usa una caché de resultados.
+-   b\) Porque un documento es buscable tras el siguiente refresh, que
+    ocurre cada segundo por defecto.
+-   c\) Porque las réplicas se actualizan al instante.
+-   d\) Porque Kibana se actualiza cada minuto.
 
-**Instrucciones:**
+**15. ¿Qué puerto usa por defecto la API REST de Elasticsearch?**
 
-1. Consulta el endpoint `_cluster/health` con credenciales de administrador:
+-   a\) 5601
+-   b\) 9300
+-   c\) 9200
+-   d\) 5044
 
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  https://localhost:9200/_cluster/health | jq .
-```
+#### Sección D. Despliegue, licencias y versiones
 
-> **Nota:** La opción `-k` omite la verificación del certificado TLS autofirmado. En producción se usaría el CA certificate.
+**16. ¿Qué herramienta despliega Elastic Stack sobre Kubernetes?**
 
-2. Observa los campos clave de la respuesta:
+-   a\) ECE
+-   b\) ECK
+-   c\) Fleet
+-   d\) Rally
 
-**Salida esperada:**
+**17. ¿Cuál de estas funciones requiere una suscripción de pago o la
+licencia de prueba?**
 
-```json
-{
-  "cluster_name": "docker-cluster",
-  "status": "green",
-  "timed_out": false,
-  "number_of_nodes": 1,
-  "number_of_data_nodes": 1,
-  "active_primary_shards": ...,
-  "active_shards": ...,
-  "relocating_shards": 0,
-  "initializing_shards": 0,
-  "unassigned_shards": 0,
-  ...
-}
-```
+-   a\) TLS y usuarios.
+-   b\) ILM.
+-   c\) Seguridad a nivel de documento y de campo.
+-   d\) Dashboards.
 
-3. Verifica la versión del nodo:
+**18. ¿Hasta cuándo tiene soporte Elastic Stack 8.19?**
 
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  https://localhost:9200 | jq '{name: .name, version: .version.number, tagline: .tagline}'
-```
+-   a\) Enero de 2026.
+-   b\) Julio de 2027.
+-   c\) Diciembre de 2030.
+-   d\) No tiene soporte.
 
-**Salida esperada:**
+**19. ¿Qué característica trae Elasticsearch 8.x por defecto?**
 
-```json
-{
-  "name": "es01",
-  "version": "8.14.1",
-  "tagline": "You Know, for Search"
-}
-```
+-   a\) Seguridad y TLS habilitados automáticamente en la instalación.
+-   b\) Varios tipos de mapping por índice.
+-   c\) Licencia Apache 2.0 únicamente.
+-   d\) Acceso sin autenticación.
 
-4. Lista los índices del sistema para confirmar que el clúster tiene datos internos inicializados:
+**20. En el laboratorio del curso, ¿cómo conviven tres nodos de
+Elasticsearch en una sola VM?**
 
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  https://localhost:9200/_cat/indices?v&h=index,health,status,docs.count | head -20
-```
+-   a\) Comparten puerto y directorio.
+-   b\) Cada uno tiene directorio, puertos y servicio systemd propios.
+-   c\) Solo uno arranca a la vez.
+-   d\) Se ejecutan en tres VMs distintas.
 
-**Verificación:** El campo `"status"` debe ser `"green"` o `"yellow"` (yellow es aceptable en un clúster de un solo nodo porque las réplicas no pueden asignarse). La versión debe ser `8.14.1`.
+------------------------------------------------------------------------
+
+### Tarea 2. Registra tus respuestas
 
----
+Anota la letra que elegiste en la columna *Mi respuesta*. Durante la
+revisión grupal, marca en *Correcta* si acertaste.
 
-### Paso 3: Explorar Kibana e identificar los componentes del stack
+| Pregunta | Mi respuesta | Correcta (sí/no) | Pregunta | Mi respuesta | Correcta (sí/no) |
+|-------|----------|-------------|-------|----------|-------------|
+| 1 |  |  | 11 |  |  |
+| 2 |  |  | 12 |  |  |
+| 3 |  |  | 13 |  |  |
+| 4 |  |  | 14 |  |  |
+| 5 |  |  | 15 |  |  |
+| 6 |  |  | 16 |  |  |
+| 7 |  |  | 17 |  |  |
+| 8 |  |  | 18 |  |  |
+| 9 |  |  | 19 |  |  |
+| 10 |  |  | 20 |  |  |
 
-**Objetivo:** Acceder a la interfaz web de Kibana y localizar las secciones correspondientes a cada componente del Elastic Stack: Fleet, Stack Monitoring, Discover e Integrations.
+### Tarea 3. Revisión grupal y plan de repaso
 
-**Instrucciones:**
+#### Paso 1. Compara tus respuestas con la clave
 
-1. Abre un navegador web y accede a:
+Con el instructor, revisa cada pregunta usando el Apéndice A. Para cada
+error, lee la explicación de la opción correcta **y** la de la opción que
+elegiste: entender por qué una opción es incorrecta corrige el concepto
+equivocado.
+
+#### Paso 2. Calcula tu resultado por sección
 
-```
-https://localhost:5601
-```
+| Sección | Preguntas | Aciertos |
+|---------------------------------------|-----------|----------|
+| A. Componentes y flujo de datos | 1 a 5 |  |
+| B. Arquitectura distribuida | 6 a 12 |  |
+| C. Indexación y búsqueda | 13 a 15 |  |
+| D. Despliegue, licencias y versiones | 16 a 20 |  |
+| **Total** | **20** |  |
 
-2. Acepta la advertencia del certificado autofirmado y autentícate con:
-   - **Usuario:** `elastic`
-   - **Contraseña:** `ElasticLabs2024!`
+**Qué hace y por qué:** el resultado por sección indica qué temas
+reforzar. La sección B es la más importante para las prácticas 2, 9 y
+10, donde instalarás un clúster de tres nodos, revisarás su salud y
+simularás la caída de un nodo.
 
-3. Una vez dentro del dashboard principal de Kibana, navega a las siguientes secciones y anota lo que observas:
+#### Paso 3. Define tu plan de repaso
 
-   **a) Stack Monitoring:**
-   - Menú lateral → **Management** → **Stack Monitoring**
-   - Observa los nodos de Elasticsearch, instancias de Kibana y Logstash reportadas.
+| Aciertos | Interpretación | Acción recomendada |
+|-------|-------------------|----------------------------------|
+| 18–20 | Dominio sólido | Continúa con la práctica 2. |
+| 14–17 | Base suficiente | Repasa las diapositivas de las preguntas falladas. |
+| 0–13 | Requiere refuerzo | Repasa el capítulo 1 completo antes de la práctica 2. |
 
-   **b) Fleet:**
-   - Menú lateral → **Management** → **Fleet**
-   - Identifica si Fleet Server está conectado (indicador verde).
-   - Observa las políticas de agente disponibles.
+### Resultado esperado
 
-   **c) Integrations:**
-   - Menú lateral → **Management** → **Integrations**
-   - Busca la integración de "Custom Logs" y "Nginx" para familiarizarte con el catálogo.
+-   Hoja de respuestas completa y revisada con la clave del Apéndice A.
+-   Resultado por sección y un plan de repaso para los temas con errores.
+-   Puedes explicar con tus palabras:
+    -   el recorrido de un evento desde su origen hasta Kibana;
+    -   la diferencia entre shard primario y réplica, y por qué una
+        réplica nunca comparte nodo con su primario;
+    -   qué significan los estados green, yellow y red;
+    -   por qué un documento tarda cerca de un segundo en ser buscable.
 
-   **d) Discover:**
-   - Menú lateral → **Analytics** → **Discover**
-   - Nota que aún no hay data views configurados con datos de laboratorio (los crearemos más adelante).
+### Referencias
+
+-   Elastic. *What is Elasticsearch? \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/elasticsearch-intro.html>
+-   Elastic. *Node roles \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/modules-node.html>
+-   Elastic. *Near real-time search \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/near-real-time.html>
+-   Elastic. *Subscriptions.* <https://www.elastic.co/subscriptions>
+-   Elastic. *Product End of Life Dates.*
+    <https://www.elastic.co/support/eol>
+
+------------------------------------------------------------------------
+
+### Apéndice A. Respuestas y justificación
 
-4. Desde la terminal, verifica la conectividad de Kibana con Elasticsearch:
+#### Clave de respuestas
+
+| Pregunta | Respuesta | Pregunta | Respuesta |
+|--------------|----------------|--------------|----------------|
+| 1 | c | 11 | b |
+| 2 | b | 12 | b |
+| 3 | b | 13 | b |
+| 4 | c | 14 | b |
+| 5 | b | 15 | c |
+| 6 | b | 16 | b |
+| 7 | b | 17 | c |
+| 8 | b | 18 | b |
+| 9 | c | 19 | a |
+| 10 | c | 20 | b |
 
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  https://localhost:5601/api/status | jq '.status.overall.level'
-```
+#### Pregunta 1. Respuesta correcta: c) Elasticsearch
 
-**Salida esperada:**
+Elasticsearch es el motor distribuido de búsqueda y análisis construido
+sobre Apache Lucene: recibe los documentos, los indexa, los almacena en
+shards y responde las consultas. **Logstash** procesa y envía datos, pero
+no los almacena; **Kibana** es la interfaz que consulta a Elasticsearch;
+**Filebeat** es un agente que lee archivos y los envía.
 
-```json
-"available"
-```
+#### Pregunta 2. Respuesta correcta: b) Logstash
 
-**Verificación:** Kibana muestra estado `"available"`, Fleet Server aparece como conectado en la UI, y Stack Monitoring reporta al menos un nodo de Elasticsearch activo.
+Logstash ejecuta pipelines con tres etapas: *input*, *filter* y
+*output*. Los filtros (`grok`, `dissect`, `date`, `mutate`, `geoip`,
+etc.) transforman y enriquecen cada evento. **Kibana** visualiza;
+**Fleet Server** coordina agentes; **Metricbeat** recolecta métricas con
+un procesamiento mínimo.
+
+#### Pregunta 3. Respuesta correcta: b) Se agregaron los Beats y la pila se unificó
 
----
+ELK eran las siglas de los tres proyectos originales. En 2015 llegaron
+los Beats y con la versión 5.0 (2016) todos los componentes empezaron a
+publicarse con el mismo número de versión, por lo que se adoptó el
+nombre **Elastic Stack**. Logstash sigue siendo parte de la pila, Kibana
+no cambió de nombre y el cambio de licencia (2021) no tuvo relación con
+el nombre.
 
-### Paso 4: Inspeccionar los contenedores y distinguir componentes legacy vs. modernos
+#### Pregunta 4. Respuesta correcta: c) Las políticas e integraciones de los Elastic Agents
+
+Fleet es la interfaz de Kibana, apoyada por **Fleet Server**, que define
+políticas de agente, agrega integraciones (Nginx, MySQL, System…) y
+recibe el estado de cada agente. Los índices se administran con las APIs
+de Elasticsearch o Index Management; los dashboards son saved objects de
+Kibana; los snapshots se administran con Snapshot and Restore y SLM.
 
-**Objetivo:** Examinar los contenedores en ejecución para comprender la diferencia arquitectónica entre Filebeat 7.17.22 (modelo legacy de Beats individuales) y el modelo moderno de Elastic Agent + Fleet.
+#### Pregunta 5. Respuesta correcta: b) Elastic Agent
+
+Elastic Agent es un solo agente por host que, mediante integraciones,
+recolecta logs, métricas y datos de seguridad, funciones que antes
+requerían varios Beats. **Heartbeat** es un Beat específico de
+disponibilidad; **Logstash** y **Kibana** no son agentes.
 
-**Instrucciones:**
+#### Pregunta 6. Respuesta correcta: b) Un objeto JSON almacenado en un índice
 
-1. Inspecciona la versión y configuración del contenedor Filebeat legacy:
+El documento es la unidad que se indexa y se busca: un objeto JSON con
+campos, un identificador `_id` y su contenido original en `_source`. La
+analogía con una fila SQL ayuda, pero es incompleta: un documento admite
+objetos anidados y arreglos, y no hay un esquema rígido de tablas. Un
+archivo de log en disco es la **fuente** del dato, no el documento; un
+shard **contiene** muchos documentos.
 
-```bash
-docker exec filebeat-legacy01 filebeat version
-```
+#### Pregunta 7. Respuesta correcta: b) Una partición de un índice; cada shard es un índice de Lucene
+
+Los índices se dividen en shards para repartir datos y trabajo entre
+nodos. Cada shard es un índice de Lucene completo, con sus segmentos.
+Una **copia de seguridad** es un snapshot; un **nodo** es una instancia
+de Elasticsearch que aloja shards; un **tipo de campo** se define en el
+mapping.
 
-**Salida esperada:**
-
-```
-filebeat version 7.17.22 (amd64), libbeat 7.17.22 ...
-```
-
-2. Revisa la configuración de Filebeat legacy:
-
-```bash
-docker exec filebeat-legacy01 cat /usr/share/filebeat/filebeat.yml
-```
-
-Observa que la configuración es un archivo YAML estático que define inputs y outputs directamente en el archivo. Este es el modelo **legacy**: cada Beat se configura individualmente en cada host.
-
-3. Ahora inspecciona Fleet Server (modelo moderno):
-
-```bash
-docker logs fleet-server01 --tail 20
-```
-
-Busca líneas que indiquen la conexión con Elasticsearch y la disponibilidad para recibir agentes:
-
-```
-"message":"fleet-server is running and available"
-```
-
-4. Compara ambos modelos documentando las diferencias observadas:
-
-| Aspecto | Filebeat 7.17 (Legacy) | Elastic Agent + Fleet (8.14) |
-|---------|------------------------|------------------------------|
-| Configuración | Archivo YAML estático por host | Política centralizada en Fleet |
-| Actualización | Manual en cada servidor | Push automático desde Kibana |
-| Alcance | Solo logs (Filebeat) | Logs, métricas, seguridad (unificado) |
-| Gestión | Individual | Centralizada vía Fleet Server |
-
-**Verificación:** Puedes ejecutar ambos comandos de versión sin error y observar claramente la diferencia de modelo de gestión entre ambos componentes.
-
----
-
-### Paso 5: Inspeccionar el pipeline preconfigurado de Logstash
-
-**Objetivo:** Examinar la configuración del pipeline de Logstash que procesará los logs de muestra de Nginx, comprendiendo las secciones input, filter y output.
-
-**Instrucciones:**
-
-1. Revisa la configuración del pipeline de Logstash:
-
-```bash
-docker exec logstash01 cat /usr/share/logstash/pipeline/nginx-sample.conf
-```
-
-2. Identifica las tres secciones del pipeline:
-
-   - **Input:** Define cómo Logstash recibe datos (en este caso, un input HTTP en el puerto 8080 o un input file).
-   - **Filter:** Aplica parsing con `grok` para descomponer las líneas de log de Nginx en campos estructurados.
-   - **Output:** Envía los eventos procesados a Elasticsearch al índice `labs-nginx-sample`.
-
-   Ejemplo de la estructura esperada:
-
-```ruby
-input {
-  http {
-    port => 8080
-    codec => "line"
-  }
-}
-
-filter {
-  grok {
-    match => { "message" => "%{COMBINEDAPACHELOG}" }
-  }
-  date {
-    match => [ "timestamp", "dd/MMM/yyyy:HH:mm:ss Z" ]
-  }
-}
-
-output {
-  elasticsearch {
-    hosts => ["https://es01:9200"]
-    index => "labs-nginx-sample"
-    user => "elastic"
-    password => "ElasticLabs2024!"
-    ssl_certificate_verification => false
-  }
-}
-```
-
-3. Verifica que Logstash está procesando correctamente (sin errores en los logs):
-
-```bash
-docker logs logstash01 --tail 30 | grep -i "pipeline"
-```
-
-Busca una línea similar a:
-
-```
-[INFO ] Pipeline started successfully {:pipeline_id=>"main" ...}
-```
-
-**Verificación:** El pipeline está activo y en estado `started`. Las tres secciones (input, filter, output) están claramente definidas en el archivo de configuración.
-
----
-
-### Paso 6: Inyectar el archivo de logs de muestra de Nginx
-
-**Objetivo:** Enviar el archivo `nginx_access_sample.log` al pipeline de Logstash a través del input HTTP para generar eventos que se indexen en Elasticsearch.
-
-**Instrucciones:**
-
-1. Verifica que el archivo de muestra existe en el repositorio:
-
-```bash
-ls -la ~/elastic-labs/sample-data/nginx_access_sample.log
-wc -l ~/elastic-labs/sample-data/nginx_access_sample.log
-```
-
-**Salida esperada:**
-
-```
-50 /home/usuario/elastic-labs/sample-data/nginx_access_sample.log
-```
-
-> El archivo contiene 50 líneas de logs de acceso Nginx en formato Combined Log.
-
-2. Envía cada línea del archivo al input HTTP de Logstash en el puerto 8080:
-
-```bash
-while IFS= read -r line; do
-  curl -s -X POST "http://localhost:8080" \
-    -H "Content-Type: text/plain" \
-    -d "$line" > /dev/null
-done < ~/elastic-labs/sample-data/nginx_access_sample.log
-echo "Inyección completada: $(wc -l < ~/elastic-labs/sample-data/nginx_access_sample.log) líneas enviadas."
-```
-
-**Salida esperada:**
-
-```
-Inyección completada: 50 líneas enviadas.
-```
-
-3. Espera 5–10 segundos para que Logstash procese los eventos y los envíe a Elasticsearch. Luego verifica que el índice fue creado:
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  https://localhost:9200/_cat/indices/labs-nginx-sample?v
-```
-
-**Salida esperada:**
-
-```
-health status index              uuid                   pri rep docs.count docs.deleted store.size pri.store.size
-yellow open   labs-nginx-sample  xxxxxxxxxxxxxxxxxxxxxx   1   1         50            0     ...kb         ...kb
-```
-
-4. Consulta algunos documentos del índice para verificar que el parsing de grok funcionó correctamente:
-
-```bash
-curl -s -k -u elastic:ElasticLabs2024! \
-  https://localhost:9200/labs-nginx-sample/_search?size=2 | jq '.hits.hits[]._source | {clientip, verb, request, response, bytes}'
-```
-
-**Salida esperada (ejemplo):**
-
-```json
-{
-  "clientip": "192.168.1.100",
-  "verb": "GET",
-  "request": "/index.html",
-  "response": "200",
-  "bytes": "1024"
-}
-{
-  "clientip": "10.0.0.55",
-  "verb": "POST",
-  "request": "/api/login",
-  "response": "302",
-  "bytes": "512"
-}
-```
-
-**Verificación:** El índice `labs-nginx-sample` existe con 50 documentos indexados y los campos están correctamente parseados (clientip, verb, request, response, bytes separados del mensaje original).
-
----
-
-### Paso 7: Visualizar los datos en Kibana Discover
-
-**Objetivo:** Crear un Data View en Kibana para el índice `labs-nginx-sample` y explorar los eventos ingestados en la interfaz Discover.
-
-**Instrucciones:**
-
-1. En el navegador, accede a Kibana:
-
-```
-https://localhost:5601
-```
-
-2. Crea un Data View programáticamente desde la terminal (alternativa rápida):
-
-```bash
-curl -s -k -X POST "https://localhost:5601/api/data_views/data_view" \
-  -H "kbn-xsrf: true" \
-  -H "Content-Type: application/json" \
-  -u elastic:ElasticLabs2024! \
-  -d '{
-    "data_view": {
-      "title": "labs-nginx-sample",
-      "name": "Labs Nginx Sample",
-      "timeFieldName": "@timestamp"
-    }
-  }' | jq '.data_view.id'
-```
-
-**Salida esperada:**
-
-```json
-"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-
-3. En Kibana, navega a **Analytics** → **Discover**.
-
-4. En el selector de Data View (parte superior izquierda), selecciona **Labs Nginx Sample**.
-
-5. Ajusta el rango de tiempo en el selector de fechas (esquina superior derecha) a **Last 7 days** o un rango que incluya las fechas de los logs de muestra.
-
-6. Deberías ver los 50 eventos listados con sus campos parseados. Expande uno de los eventos para verificar que los campos `clientip`, `verb`, `request`, `response` y `bytes` están presentes.
-
-**Verificación:** Los 50 eventos aparecen en Discover con campos estructurados correctamente parseados. El Data View `Labs Nginx Sample` está disponible para futuras consultas.
-
----
-
-### Paso 8: Documentar el entorno para referencia futura
-
-**Objetivo:** Crear un archivo de referencia rápida con todos los endpoints, puertos y credenciales del entorno de laboratorio que servirá como consulta para las prácticas siguientes.
-
-**Instrucciones:**
-
-1. Crea el archivo de referencia:
-
-```bash
-cat > ~/elastic-labs/ENTORNO_REFERENCIA.md << 'EOF'
-# Referencia Rápida del Entorno de Laboratorio
-
-## Endpoints de Servicios
-
-| Servicio | URL | Puerto |
-|----------|-----|--------|
-| Elasticsearch | https://localhost:9200 | 9200 |
-| Kibana | https://localhost:5601 | 5601 |
-| Logstash (Beats input) | localhost:5044 | 5044 |
-| Logstash (HTTP input) | http://localhost:8080 | 8080 |
-| Fleet Server | https://localhost:8220 | 8220 |
-
-## Credenciales
-
-| Usuario | Contraseña | Propósito |
-|---------|------------|-----------|
-| elastic | ElasticLabs2024! | Admin general |
-| kibana_system | KibanaLabs2024! | Servicio Kibana |
-
-## Contenedores
-
-| Nombre | Imagen | Versión |
-|--------|--------|---------|
-| es01 | elasticsearch | 8.14.1 |
-| kibana01 | kibana | 8.14.1 |
-| logstash01 | logstash | 8.14.1 |
-| fleet-server01 | elastic-agent | 8.14.1 |
-| filebeat-legacy01 | filebeat | 7.17.22 |
-
-## Comandos Útiles
-
-```bash
-# Verificar estado del clúster
-curl -s -k -u elastic:ElasticLabs2024! https://localhost:9200/_cluster/health | jq .
-
-# Listar índices
-curl -s -k -u elastic:ElasticLabs2024! https://localhost:9200/_cat/indices?v
-
-# Reiniciar todo el stack
-cd ~/elastic-labs/config && docker compose restart
-
-# Detener todo el stack
-cd ~/elastic-labs/config && docker compose down
-
-# Ver logs de un contenedor
-docker logs <nombre_contenedor> --tail 50
-```
-
-## Red Docker
-
-- Nombre: elastic-net
-- Subred: 172.20.0.0/24
-- Driver: bridge
-EOF
-```
-
-2. Verifica que el archivo se creó correctamente:
-
-```bash
-cat ~/elastic-labs/ENTORNO_REFERENCIA.md
-```
-
-**Verificación:** El archivo `ENTORNO_REFERENCIA.md` existe y contiene toda la información de endpoints, credenciales y comandos útiles del entorno.
-
----
-
-## Resumen de Validaciones Finales
-
-Ejecuta este bloque de comandos como verificación integral del laboratorio completado:
-
-```bash
-echo "=== Verificación Final del Lab 01-00-01 ==="
-echo ""
-echo "1. Contenedores activos:"
-docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "es01|kibana01|logstash01|fleet-server01|filebeat-legacy01"
-echo ""
-echo "2. Salud del clúster:"
-curl -s -k -u elastic:ElasticLabs2024! https://localhost:9200/_cluster/health | jq '{status: .status, nodes: .number_of_nodes}'
-echo ""
-echo "3. Versión de Elasticsearch:"
-curl -s -k -u elastic:ElasticLabs2024! https://localhost:9200 | jq '.version.number'
-echo ""
-echo "4. Estado de Kibana:"
-curl -s -k -u elastic:ElasticLabs2024! https://localhost:5601/api/status | jq '.status.overall.level'
-echo ""
-echo "5. Documentos en labs-nginx-sample:"
-curl -s -k -u elastic:ElasticLabs2024! https://localhost:9200/labs-nginx-sample/_count | jq '.count'
-echo ""
-echo "6. Filebeat legacy version:"
-docker exec filebeat-legacy01 filebeat version 2>/dev/null | head -1
-echo ""
-echo "=== Verificación completada ==="
-```
-
-**Salida esperada:**
-
-```
-=== Verificación Final del Lab 01-00-01 ===
-
-1. Contenedores activos:
-es01                Up X minutes
-kibana01            Up X minutes
-logstash01          Up X minutes
-fleet-server01      Up X minutes
-filebeat-legacy01   Up X minutes
-
-2. Salud del clúster:
-{
-  "status": "yellow",
-  "nodes": 1
-}
-
-3. Versión de Elasticsearch:
-"8.14.1"
-
-4. Estado de Kibana:
-"available"
-
-5. Documentos en labs-nginx-sample:
-50
-
-6. Filebeat legacy version:
-filebeat version 7.17.22 (amd64), libbeat 7.17.22 ...
-
-=== Verificación completada ===
-```
-
----
-
-## Troubleshooting
-
-| Problema | Causa probable | Solución |
-|----------|---------------|----------|
-| Contenedor `es01` en estado `Restarting` | Insuficiente memoria para la JVM | Ejecutar `sudo sysctl -w vm.max_map_count=262144` y reiniciar con `docker compose restart es01` |
-| Kibana muestra "Kibana server is not ready yet" | Elasticsearch aún no completó su inicio | Esperar 60 segundos adicionales y recargar la página |
-| `curl` a puerto 9200 retorna "Connection refused" | El contenedor aún está iniciando o el puerto no está mapeado | Verificar con `docker ps` que el contenedor está `Up` y el puerto está listado |
-| El índice `labs-nginx-sample` no aparece | Los eventos no llegaron a Logstash o hubo error de parsing | Revisar `docker logs logstash01 --tail 50` buscando errores de grok o conexión |
-| Fleet Server no aparece como conectado en Kibana | Fleet Server necesita más tiempo para registrarse | Esperar 2 minutos y refrescar la página de Fleet en Kibana |
-| Error "max virtual memory areas vm.max_map_count [65530] is too low" | Configuración de kernel insuficiente para Elasticsearch | Ejecutar `sudo sysctl -w vm.max_map_count=262144` y añadir a `/etc/sysctl.conf` para persistencia |
-
----
-
-## Limpieza (opcional)
-
-Si necesitas liberar recursos al finalizar la práctica (no recomendado si continuarás con los siguientes laboratorios):
-
-```bash
-cd ~/elastic-labs/config
-docker compose down -v
-```
-
-> **Advertencia:** El flag `-v` elimina los volúmenes de datos. Solo usar si deseas un reset completo del entorno.
-
----
+#### Pregunta 8. Respuesta correcta: b) En el mismo nodo que su shard primario
+
+La réplica existe para que los datos sobrevivan a la caída de un nodo.
+Si estuviera en el mismo nodo que su primario, ambos se perderían a la
+vez. Por eso Elasticsearch nunca asigna una réplica junto a su primario:
+en un clúster de un solo nodo las réplicas quedan sin asignar y el estado
+es yellow. Las opciones a, c y d son ubicaciones válidas.
+
+#### Pregunta 9. Respuesta correcta: c) Todos los primarios están asignados, pero alguna réplica no
+
+**Yellow** significa que todos los datos están disponibles, pero sin la
+redundancia completa. **Green** es la opción a (todo asignado); **red**
+es la opción b (falta al menos un primario: hay datos no disponibles). Un
+clúster apagado no responde a la API, no reporta ningún color.
+
+#### Pregunta 10. Respuesta correcta: c) 3
+
+La elección del master requiere un **quórum** (mayoría) de nodos
+elegibles. Con 3 nodos el quórum es 2: si cae uno, los otros dos siguen
+eligiendo master. Con 2 nodos el quórum también es 2, así que la caída de
+uno detiene la elección; con 1 no hay tolerancia. Con 4 el quórum es 3 y
+solo se tolera la caída de uno, igual que con 3: por eso se recomienda
+un número impar.
+
+#### Pregunta 11. Respuesta correcta: b) `ingest`
+
+Los nodos con rol `ingest` ejecutan los procesadores de los ingest
+pipelines antes de indexar. `master` administra el estado del clúster;
+`ml` ejecuta Machine Learning; `transform` ejecuta transformaciones
+continuas de datos.
+
+#### Pregunta 12. Respuesta correcta: b) Nodo de solo coordinación
+
+Con la lista de roles vacía, el nodo no guarda datos ni puede ser
+master: solo recibe peticiones, las distribuye a los nodos de datos y
+combina los resultados. Es útil en clústeres grandes para descargar a los
+nodos de datos. Un master dedicado se configura con
+`node.roles: [ master ]`; un nodo frozen con `data_frozen`. La
+configuración es válida y el nodo arranca.
+
+#### Pregunta 13. Respuesta correcta: b) El índice invertido
+
+El índice invertido guarda, para cada término, la lista de documentos
+que lo contienen; así, buscar una palabra entre millones de documentos
+es leer una sola entrada. El **translog** registra operaciones para dar
+durabilidad; el **mapping** define los campos; el **snapshot** es un
+respaldo.
+
+#### Pregunta 14. Respuesta correcta: b) Porque un documento es buscable tras el siguiente refresh
+
+Al indexar, el documento entra a un buffer en memoria. El **refresh**,
+cada segundo por defecto (`index.refresh_interval`), escribe el buffer
+como un segmento nuevo y lo vuelve buscable. Por eso hay hasta cerca de
+un segundo de retraso: búsqueda NRT (*near real time*). Las otras
+opciones describen mecanismos que no determinan la visibilidad del
+documento.
+
+#### Pregunta 15. Respuesta correcta: c) 9200
+
+9200 es el puerto HTTP(S) de la API REST. **9300** es el puerto de
+transporte entre nodos; **5601** es Kibana; **5044** es el input `beats`
+de Logstash. En el laboratorio los tres nodos usan 9200, 9201 y 9202
+para la API, y 9300, 9301 y 9302 para el transporte.
+
+#### Pregunta 16. Respuesta correcta: b) ECK
+
+ECK (*Elastic Cloud on Kubernetes*) es el operador oficial para
+desplegar y administrar Elastic Stack en Kubernetes de forma
+declarativa. **ECE** (*Elastic Cloud Enterprise*) es una plataforma para
+ofrecer clústeres como servicio en infraestructura propia; **Fleet**
+administra agentes; **Rally** es una herramienta de pruebas de
+rendimiento.
+
+#### Pregunta 17. Respuesta correcta: c) Seguridad a nivel de documento y de campo
+
+DLS y FLS requieren la suscripción Platinum o superior, o la licencia de
+prueba de 30 días que activarás en la práctica 8. TLS, usuarios, roles,
+ILM y dashboards están incluidos en la licencia Basic, que es gratuita.
+
+#### Pregunta 18. Respuesta correcta: b) Julio de 2027
+
+8.19 es la última versión menor de la serie 8 y tiene soporte hasta el
+**15 de julio de 2027**. Enero de 2026 corresponde al fin de soporte de
+7.17. Ninguna versión tiene soporte hasta 2030 según la tabla publicada
+por Elastic. Por eso planear la migración a 9.x es parte de la
+operación (capítulo 10).
+
+#### Pregunta 19. Respuesta correcta: a) Seguridad y TLS habilitados automáticamente
+
+Desde la versión 8.0, el primer arranque de un nodo nuevo genera
+certificados, activa TLS en HTTP y transporte, crea la contraseña del
+usuario `elastic` y emite un enrollment token para Kibana. Los tipos de
+mapping múltiples desaparecieron en 7.x; la licencia por defecto es
+Elastic License 2.0 (con SSPL y AGPLv3 como opciones del código fuente);
+el acceso sin autenticación es lo contrario de lo que hace 8.x.
+
+#### Pregunta 20. Respuesta correcta: b) Cada uno con directorio, puertos y servicio systemd propios
+
+En la VM del laboratorio cada nodo se instala en
+`/opt/elastic/es01`, `es02` y `es03`, con su propio `elasticsearch.yml`,
+sus puertos (9200/9300, 9201/9301 y 9202/9302) y su servicio `es@01`,
+`es@02` y `es@03`. Dos nodos no pueden compartir puerto ni directorio de
+datos; los tres arrancan al mismo tiempo para formar un clúster real
+dentro de una sola VM.
