@@ -1,1388 +1,442 @@
-# Medir y optimizar un pipeline de ingestión de logs
+# ELK Stack: Elasticsearch, Logstash y Kibana
 
-## Metadata
+## Práctica 9. Medir y optimizar el rendimiento de la ingesta
 
-| Campo | Valor |
-|-------|-------|
-| **Duración** | 54 minutos |
-| **Complejidad** | Alta |
-| **Nivel Bloom** | Aplicar |
+### Objetivo
 
-## Descripción General
+Al finalizar la práctica, serás capaz de:
 
-En este laboratorio ejecutarás un ciclo completo de benchmark, análisis, optimización y validación de un pipeline de ingestión de logs. Generarás 50.000 eventos sintéticos con un script Python, medirás la línea base de rendimiento (throughput, latencia, backlog), identificarás cuellos de botella mediante las APIs de monitoreo de Logstash y Elasticsearch, aplicarás optimizaciones específicas y compararás el rendimiento entre Logstash+Filebeat y Elastic Agent.
+-   Habilitar Stack Monitoring con Metricbeat para Elasticsearch, Kibana
+    y Logstash.
+-   Medir una línea base de throughput y ubicar el filtro más costoso con
+    la API de monitoreo de Logstash.
+-   Optimizar un pipeline (dissect, workers, tamaño de lote) y un data
+    stream (refresh y réplicas) midiendo el efecto de cada cambio.
+-   Detectar una consulta lenta con los slow logs y corregirla con la
+    Profile API.
 
-## Objetivos de Aprendizaje
+### Objetivo visual
 
-- [ ] Establecer una línea base de rendimiento midiendo throughput (EPS), latencia de procesamiento y tamaño del backlog bajo carga controlada
-- [ ] Identificar cuellos de botella en el pipeline usando métricas de la API de monitoreo de Logstash y estadísticas de Elasticsearch
-- [ ] Ajustar `pipeline.workers`, `pipeline.batch.size` y compresión HTTP para maximizar el throughput sin degradar la latencia
-- [ ] Comparar el rendimiento de Filebeat vs Elastic Agent para recolección de logs de archivo y documentar diferencias cuantitativas
+![Ciclo de medición y optimización](img/lab09.png){width="6.3in"}\
 
-## Prerrequisitos
+### Duración aproximada
 
-### Conocimiento previo
+-   75 minutos.
 
-- Comprensión de la arquitectura Elastic Stack y el rol de cada componente
-- Familiaridad con configuración de pipelines de Logstash (inputs, filters, outputs)
-- Experiencia con las APIs REST de Elasticsearch y Logstash
-- Conceptos de throughput, latencia y backlog (Lección 9.1)
+### Prerrequisitos
 
-### Acceso requerido
+-   Prácticas 2 a 8 completadas: pipelines `web`, `orders-jdbc`,
+    `syslog` y `dlq-syslog` funcionando.
+-   Instalador `metricbeat-8.19.x-linux-x86_64.tar.gz` en
+    `$LABS/downloads`.
+-   Al menos 1 GB libre en disco para el archivo y el data stream de
+    carga.
 
-- Entorno del Lab 8 completado con ILM, SLM y seguridad configurados
-- Stack Elastic (Elasticsearch, Kibana, Logstash) 8.14.1 operativo en Docker
-- Python 3.12.3 con paquetes `faker` y `requests` instalados
-- Filebeat 8.14.1 instalado o disponible como contenedor
-- Acceso a `localhost:9200` (Elasticsearch), `localhost:9600` (Logstash API), `localhost:5601` (Kibana)
+### Instrucciones
 
-## Entorno del Laboratorio
+**Escenario:** el Buen Fin se acerca y MercaNova espera tres veces el
+tráfico normal. El equipo debe saber cuántos eventos por segundo
+soporta la ingesta y dónde está el cuello de botella antes de que
+llegue el pico. Medirás, cambiarás **una sola variable a la vez** y
+volverás a medir.
 
-### Software utilizado
+**Importante:** en una sola VM, Logstash y los tres nodos de
+Elasticsearch compiten por la misma CPU y el mismo disco. Tus números
+serán distintos a los de esta guía; lo que importa es la **tendencia**
+y el método.
 
-| Componente | Versión | Puerto |
-|------------|---------|--------|
-| Elasticsearch | 8.14.1 | 9200 |
-| Kibana | 8.14.1 | 5601 |
-| Logstash | 8.14.1 | 9600 (API), 5044 (Beats) |
-| Filebeat | 8.14.1 | 5066 (métricas HTTP) |
-| Python | 3.12.3 | — |
-| faker | 24.3.0 | — |
+Usa esta tabla para registrar tus resultados:
 
-### Preparación inicial del entorno
+| Prueba | Cambio | eventos/s | ms/evento | CPU (%) |
+|---------|--------------------------|---------|---------|---------|
+| 1 | Línea base: grok, 1 worker, lote 125 | | | |
+| 2 | grok → dissect | | | |
+| 3 | 4 workers | | | |
+| 4 | Lote de 500 | | | |
+| 5 | `refresh_interval` 10 s y 0 réplicas | | | |
 
-```bash
-# Verificar que el stack está corriendo
-cd ~/elastic-labs/
-docker compose ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
-
-# Verificar conectividad con Elasticsearch
-curl -sk -u elastic:ElasticLabs2024! https://localhost:9200/_cluster/health?pretty | jq '.status'
-
-# Verificar API de monitoreo de Logstash
-curl -s http://localhost:9600/_node/stats | jq '.status'
-
-# Crear directorio de trabajo para este lab
-mkdir -p ~/elastic-labs/lab09/{configs,results}
+``` 
+$ source /home/student/labs/scripts/env.sh && cd $LABS
 ```
 
-## Paso a Paso
+------------------------------------------------------------------------
 
----
+### Tarea 1. Stack Monitoring con Metricbeat
 
-### Paso 1: Crear el generador de logs sintéticos
+#### Paso 1. Asigna contraseña al usuario de monitoreo
 
-**Objetivo:** Crear un script Python que genere 50.000 eventos de log en formato JSON a una tasa controlada de 1.000 eventos/segundo.
+``` 
+POST _security/user/remote_monitoring_user/_password
+{ "password": "Monitoreo#2026" }
 
-**Instrucciones:**
+GET /?filter_path=cluster_uuid
+```
 
-1. Crea el script generador:
+**Qué hace y por qué:** `remote_monitoring_user` es un usuario integrado
+con el rol `remote_monitoring_collector`: puede **leer** métricas de los
+nodos y **escribir** en los índices de monitoreo, nada más. Anota el
+`cluster_uuid`: lo necesitará Logstash en el Paso 3.
 
-```bash
-cat > ~/elastic-labs/scripts/benchmark_log_generator.py << 'EOF'
-#!/usr/bin/env python3
-"""Generador de logs sintéticos para benchmark de ingestión."""
+#### Paso 2. Instala y configura Metricbeat
 
-import json
-import time
-import sys
-import os
-from datetime import datetime, timezone
-from faker import Faker
+``` 
+$ sudo mkdir -p /opt/elastic/metricbeat
+$ sudo tar -xzf downloads/metricbeat-$V-linux-x86_64.tar.gz \
+      -C /opt/elastic/metricbeat --strip-components=1
+$ cd /opt/elastic/metricbeat
+$ sudo cp $LABS/config/metricbeat/metricbeat.yml .
+$ sudo rm -f modules.d/system.yml
+$ sudo cp $LABS/config/metricbeat/*-xpack.yml modules.d/
+$ sudo ./metricbeat keystore create
+$ sudo ./metricbeat keystore add MON_PWD
+$ sudo chown -R root:root .
+$ sudo chmod go-w metricbeat.yml modules.d/*
+$ sudo ./metricbeat test config && sudo ./metricbeat test output
+```
 
-fake = Faker()
+**Qué hace y por qué:** el módulo `elasticsearch` con
+`xpack.enabled: true` recolecta exactamente las métricas que muestra la
+interfaz de **Stack Monitoring**. Revisa en
+`modules.d/elasticsearch-xpack.yml`:
 
-# Configuración
-TOTAL_EVENTS = 50000
-RATE_PER_SECOND = 1000
-OUTPUT_FILE = "/tmp/benchmark-app.log"
+| Parámetro | Por qué |
+|---------------|---------------------------------------------|
+| `hosts` | Los tres nodos (9200, 9201, 9202). |
+| `scope: node` | Metricbeat consulta cada nodo por separado; si cae uno, sigue recibiendo métricas de los demás. |
+| `period: 10s` | Frecuencia de recolección: buena resolución sin saturar. |
+| `ssl.certificate_authorities` | La CA del clúster. |
 
-# Niveles de log con distribución realista
-LOG_LEVELS = ["INFO"] * 70 + ["WARN"] * 15 + ["ERROR"] * 10 + ["DEBUG"] * 5
+Se elimina `system.yml` porque no queremos métricas del sistema
+operativo en este ejercicio.
 
-# Servicios simulados
-SERVICES = ["auth-service", "payment-api", "user-service", "order-processor", "notification-worker"]
+#### Paso 3. Vincula Logstash al clúster y arranca Metricbeat
 
-def generate_event(seq_num):
-    """Genera un evento de log en formato JSON."""
-    return {
-        "@timestamp": datetime.now(timezone.utc).isoformat(),
-        "sequence": seq_num,
-        "level": fake.random_element(LOG_LEVELS),
-        "service": fake.random_element(SERVICES),
-        "message": fake.sentence(nb_words=12),
-        "source_ip": fake.ipv4(),
-        "user_id": fake.uuid4(),
-        "response_time_ms": fake.random_int(min=1, max=5000),
-        "http_method": fake.random_element(["GET", "POST", "PUT", "DELETE"]),
-        "http_path": fake.uri_path(deep=3),
-        "http_status": fake.random_element([200, 200, 200, 201, 301, 400, 403, 404, 500]),
-        "bytes_sent": fake.random_int(min=100, max=50000),
-        "trace_id": fake.hexify(text="^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
-    }
+``` 
+$ echo 'monitoring.cluster_uuid: "<CLUSTER_UUID>"' | \
+  sudo tee -a /opt/elastic/logstash/config/logstash.yml
+$ sudo systemctl restart logstash
+$ sudo cp $LABS/config/systemd/metricbeat.service /etc/systemd/system/
+$ sudo systemctl daemon-reload && sudo systemctl enable --now metricbeat
+```
 
-def main():
-    """Genera eventos a tasa controlada."""
-    # Limpiar archivo previo
-    if os.path.exists(OUTPUT_FILE):
-        os.remove(OUTPUT_FILE)
+**Qué hace y por qué:** Logstash no pertenece al clúster, así que
+`monitoring.cluster_uuid` le indica a Stack Monitoring a qué clúster
+mostrarlo asociado. Después de 1 o 2 minutos, abre **Management \> Stack
+Monitoring**: verás los 3 nodos, Kibana y Logstash con sus pipelines.
 
-    print(f"[*] Generando {TOTAL_EVENTS} eventos a {RATE_PER_SECOND} EPS...")
-    print(f"[*] Archivo de salida: {OUTPUT_FILE}")
+#### Paso 4. Recorre las métricas clave
 
-    start_time = time.time()
-    batch_size = 100  # Escribir en lotes para eficiencia de I/O
-    events_written = 0
+En Stack Monitoring revisa **Nodes** (heap, CPU, disco), **Indices**
+(tasa de indexación) y **Logstash \> Pipelines**. Complementa con:
 
-    with open(OUTPUT_FILE, "w") as f:
-        while events_written < TOTAL_EVENTS:
-            batch_start = time.time()
+``` 
+GET _cat/nodes?v&h=name,heap.percent,cpu,load_1m,disk.used_percent
+GET _cat/thread_pool/write,search?v&h=node_name,name,queue,rejected
+```
 
-            # Escribir un lote
-            for i in range(min(batch_size, TOTAL_EVENTS - events_written)):
-                event = generate_event(events_written + i)
-                f.write(json.dumps(event) + "\n")
+**Qué hace y por qué:** el thread pool `write` atiende las peticiones
+de indexación. Si `queue` crece y `rejected` es mayor que 0, Elasticsearch
+está rechazando escrituras: el cuello de botella está en el clúster, no
+en Logstash. Anota los valores de reposo para compararlos durante la
+carga.
 
-            events_written += min(batch_size, TOTAL_EVENTS - events_written)
-            f.flush()
+### Tarea 2. Línea base
 
-            # Control de tasa
-            elapsed_in_batch = time.time() - batch_start
-            expected_time = batch_size / RATE_PER_SECOND
-            if elapsed_in_batch < expected_time:
-                time.sleep(expected_time - elapsed_in_batch)
+#### Paso 5. Genera el archivo de carga
 
-            # Progreso cada 10%
-            if events_written % (TOTAL_EVENTS // 10) == 0:
-                elapsed = time.time() - start_time
-                rate = events_written / elapsed if elapsed > 0 else 0
-                print(f"    Progreso: {events_written}/{TOTAL_EVENTS} "
-                      f"({events_written*100//TOTAL_EVENTS}%) - "
-                      f"Tasa real: {rate:.0f} EPS")
+``` 
+$ scripts/make-loadfile.sh
+Archivo de carga: /home/student/labs/data/lab09/load-101523.log
+(293040 líneas)
+```
 
-    total_time = time.time() - start_time
-    file_size = os.path.getsize(OUTPUT_FILE) / (1024 * 1024)
-    print(f"\n[✓] Completado: {events_written} eventos en {total_time:.1f}s")
-    print(f"    Tasa media: {events_written/total_time:.0f} EPS")
-    print(f"    Tamaño archivo: {file_size:.2f} MB")
+**Qué hace y por qué:** repite 11 veces el log web del 19 de octubre,
+sin health checks: casi 300 000 líneas, suficiente para medir varios
+minutos de carga sostenida.
 
-if __name__ == "__main__":
-    main()
+#### Paso 6. Agrega el pipeline de prueba con la configuración base
+
+``` 
+$ sudo tee -a /opt/elastic/logstash/config/pipelines.yml \
+  > /dev/null <<'EOF'
+
+- pipeline.id: loadtest
+  path.config: "/opt/elastic/logstash/pipelines/loadtest.conf"
+  pipeline.workers: 1
+  pipeline.batch.size: 125
 EOF
-
-chmod +x ~/elastic-labs/scripts/benchmark_log_generator.py
+$ sudo systemctl restart logstash
 ```
 
-2. Instala las dependencias necesarias (si no están disponibles):
+**Qué hace y por qué:** `loadtest.conf` lee el archivo con
+`mode => "read"` y `sincedb_path => "/dev/null"`: cada reinicio vuelve a
+leerlo completo, lo que permite repetir la prueba. Aplica `grok`,
+`date`, `geoip` y `useragent`, igual que el pipeline web, y escribe en
+`logs-loadtest-default`. Empezamos con 1 worker y lote de 125 para tener
+una línea base modesta.
 
-```bash
-pip3 install faker==24.3.0 requests==2.31.0 --quiet
+#### Paso 7. Mide el throughput
+
+Espera 20 segundos después del reinicio y ejecuta:
+
+``` 
+$ scripts/ls-throughput.sh loadtest 30
+pipeline=loadtest  eventos=99300  segundos=30  eventos/s=3310
+ms/evento: 0.29
+$ top -b -n 1 | head -15
 ```
 
-3. Ejecuta el generador para crear el archivo de benchmark:
+**Qué hace y por qué:** el script lee `events.out` de la API de Logstash
+al inicio y al final de 30 segundos y calcula eventos por segundo. El
+valor `ms/evento` es el tiempo promedio de procesamiento por evento
+(`duration_in_millis / out`). En `top`, observa cuánta CPU usa el
+proceso `java` de Logstash frente a los de Elasticsearch. Anota la
+**prueba 1**.
 
-```bash
-python3 ~/elastic-labs/scripts/benchmark_log_generator.py
+#### Paso 8. Ubica el filtro más costoso
+
+``` 
+$ curl -s localhost:9600/_node/stats/pipelines/loadtest | jq -r '
+  .pipelines.loadtest.plugins.filters[] |
+  "\(.id)\t\(.events.duration_in_millis) ms\t\(.events.out) ev"'
+grok-load       41250 ms   120000 ev
+useragent-load  16810 ms   120000 ev
+geoip-load       6020 ms   120000 ev
+date-load        2210 ms   120000 ev
 ```
 
-**Salida esperada:**
+**Qué hace y por qué:** cada filtro reporta el tiempo **acumulado** que
+ha consumido. El `id` explícito de cada plugin hace legible esta salida;
+sin él, verías identificadores aleatorios. En este ejemplo, grok consume
+más de la mitad del tiempo: es el primer candidato a optimizar.
 
-```
-[*] Generando 50000 eventos a 1000 EPS...
-[*] Archivo de salida: /tmp/benchmark-app.log
-    Progreso: 5000/50000 (10%) - Tasa real: 998 EPS
-    Progreso: 10000/50000 (20%) - Tasa real: 1001 EPS
-    ...
-    Progreso: 50000/50000 (100%) - Tasa real: 999 EPS
+### Tarea 3. Optimizar el pipeline
 
-[✓] Completado: 50000 eventos en 50.1s
-    Tasa media: 999 EPS
-    Tamaño archivo: 28.43 MB
-```
+#### Paso 9. Reemplaza grok por dissect
 
-**Verificación:**
-
-```bash
-# Verificar número de líneas y formato
-wc -l /tmp/benchmark-app.log
-head -1 /tmp/benchmark-app.log | python3 -m json.tool
+``` 
+$ cd /opt/elastic/logstash
+$ sudo cp pipelines/loadtest.conf pipelines/loadtest.conf.grok
+$ sudo vi pipelines/loadtest.conf
 ```
 
-Debe mostrar exactamente 50000 líneas y el primer evento debe ser JSON válido con los campos definidos.
+Sustituye el bloque `grok { ... }` por:
 
----
-
-### Paso 2: Configurar el pipeline de Logstash con línea base (sin optimizar)
-
-**Objetivo:** Configurar Logstash con parámetros conservadores (1 worker, batch_size 125) para establecer la línea base de rendimiento.
-
-**Instrucciones:**
-
-1. Crea la configuración de pipeline para benchmark:
-
-```bash
-cat > ~/elastic-labs/lab09/configs/benchmark-baseline.conf << 'EOF'
-input {
-  file {
-    path => "/tmp/benchmark-app.log"
-    start_position => "beginning"
-    sincedb_path => "/tmp/sincedb_benchmark"
-    codec => "json"
-    mode => "read"
-    file_completed_action => "log"
-    file_completed_log_path => "/tmp/file_completed.log"
+``` 
+dissect {
+  id => "dissect-load"
+  mapping => { "message" => '%{[source][address]} - %{[user][name]}
+    [%{timestamp}] "%{[http][request][method]} %{[url][original]}
+    HTTP/%{[http][version]}" %{[http][response][status_code]}
+    %{[http][response][body][bytes]} "%{[http][request][referrer]}"
+    "%{[user_agent][original]}" %{[event][duration_s]}' }
+  convert_datatype => {
+    "[http][response][status_code]" => "int"
+    "[http][response][body][bytes]" => "int"
+    "[event][duration_s]" => "float"
   }
 }
+```
 
-filter {
-  # Simulación de procesamiento con grok (intencionalmente subóptimo para la línea base)
-  mutate {
-    add_field => {
-      "[@metadata][pipeline]" => "benchmark-baseline"
-      "[event][dataset]" => "benchmark.app"
-    }
-  }
+(El valor de `mapping` va en una sola línea).
 
-  # Parseo de timestamp
-  date {
-    match => ["@timestamp", "ISO8601"]
-    target => "@timestamp"
-  }
+**Qué hace y por qué:** **dissect** divide la línea por **delimitadores
+fijos** (espacios, corchetes, comillas) sin expresiones regulares, por
+eso es mucho más rápido que grok. Funciona porque el formato del log de
+Nginx es estable. `convert_datatype` convierte los números, que grok
+convertía con `:int` y `:float`. El costo: dissect no tolera variaciones
+de formato; si una línea no coincide, la marca con
+`_dissectfailure`.
 
-  # Enriquecimiento: clasificar por nivel
-  if [level] == "ERROR" {
-    mutate { add_tag => ["high_priority"] }
-  } else if [level] == "WARN" {
-    mutate { add_tag => ["medium_priority"] }
-  }
+#### Paso 10. Mide de nuevo
 
-  # Conversión de tipos
-  mutate {
-    convert => {
-      "response_time_ms" => "integer"
-      "bytes_sent" => "integer"
-      "sequence" => "integer"
-    }
-  }
+``` 
+DELETE _data_stream/logs-loadtest-default
+```
+
+``` 
+$ sudo systemctl restart logstash && sleep 20
+$ scripts/ls-throughput.sh loadtest 30
+```
+
+**Qué hace y por qué:** borrar el data stream antes de cada prueba
+evita que el tamaño creciente del índice afecte la comparación. Anota la
+**prueba 2** y revisa otra vez los tiempos por filtro: ahora
+`useragent-load` es el más costoso.
+
+#### Paso 11. Aumenta los workers
+
+Edita en `pipelines.yml` el pipeline `loadtest`:
+`pipeline.workers: 4`. Borra el data stream, reinicia, mide y anota la
+**prueba 3**.
+
+**Qué hace y por qué:** cada worker toma un lote de la cola y ejecuta
+filtros y salidas en paralelo. Aumentar los workers ayuda mientras haya
+CPU libre; en una VM compartida, a partir de cierto punto, Logstash le
+quita CPU a Elasticsearch y el throughput deja de crecer o incluso baja.
+
+#### Paso 12. Aumenta el tamaño del lote
+
+Cambia `pipeline.batch.size: 500`, borra el data stream, reinicia,
+mide y anota la **prueba 4**.
+
+**Qué hace y por qué:** cada lote se envía a Elasticsearch como una
+petición Bulk. Lotes más grandes reducen el número de peticiones y su
+overhead, a cambio de más memoria en Logstash
+(`workers × batch.size` eventos en vuelo) y algo más de latencia.
+
+#### Paso 13. Ajusta el destino: refresh y réplicas
+
+``` 
+PUT _index_template/loadtest
+{
+  "index_patterns": [ "logs-loadtest-*" ],
+  "data_stream": {},
+  "composed_of": [ "ecs@mappings" ],
+  "priority": 500,
+  "template": { "settings": {
+    "index.refresh_interval": "10s",
+    "index.number_of_replicas": 0 } }
 }
 
-output {
-  elasticsearch {
-    hosts => ["https://es01:9200"]
-    user => "elastic"
-    password => "ElasticLabs2024!"
-    ssl_certificate_authorities => ["/usr/share/logstash/config/certs/ca/ca.crt"]
-    index => "labs-benchmark-baseline-%{+YYYY.MM.dd}"
-    http_compression => false
-  }
+DELETE _data_stream/logs-loadtest-default
+```
+
+Reinicia Logstash, mide y anota la **prueba 5**.
+
+**Qué hace y por qué:**
+
+| Ajuste | Efecto en la carga | Costo |
+|---------|---------------------------|------------------------|
+| `refresh_interval: 10s` | Menos segmentos pequeños y menos merges: más eventos por segundo. | Los datos tardan hasta 10 s en ser buscables. |
+| `number_of_replicas: 0` | Cada documento se indexa una vez, no dos. | Sin redundancia: aceptable solo durante una carga inicial. |
+
+Para una carga histórica masiva, la receta es: réplicas en 0 y refresh
+desactivado (`-1`) durante la carga, y restaurarlos al terminar.
+
+#### Paso 14. Compara y concluye
+
+Completa la tabla del inicio. Un resultado típico en la VM del curso:
+
+``` 
+Prueba                         eventos/s   ms/evento
+-----------------------------  ---------   ---------
+1 Línea base                       3 300        0.29
+2 grok -> dissect                  4 600        0.21
+3 4 workers                        7 400        0.22
+4 lote 500                         8 300        0.20
+5 refresh 10 s + 0 réplicas        9 600        0.19
+```
+
+**Qué hace y por qué:** cada ajuste tiene un efecto medible y aislado.
+Si un cambio no mejoró, revierte: optimizar sin medir lleva a
+configuraciones más complejas sin beneficio. Al terminar, quita el
+pipeline `loadtest` de `pipelines.yml`, reinicia Logstash y borra el
+data stream y el archivo de carga para liberar disco.
+
+### Tarea 4. Consultas lentas
+
+#### Paso 15. Activa los slow logs del data stream web
+
+``` 
+PUT logs-mercanova.web-default/_settings
+{
+  "index.search.slowlog.threshold.query.warn": "500ms",
+  "index.search.slowlog.threshold.query.info": "50ms",
+  "index.search.slowlog.threshold.fetch.info": "50ms"
 }
-EOF
 ```
 
-2. Crea la configuración de Logstash con parámetros conservadores:
-
-```bash
-cat > ~/elastic-labs/lab09/configs/logstash-baseline.yml << 'EOF'
-# Configuración de línea base - SIN optimizar
-pipeline.workers: 1
-pipeline.batch.size: 125
-pipeline.batch.delay: 50
-
-# Monitoreo habilitado
-api.http.host: "0.0.0.0"
-api.http.port: 9600
-
-# Cola en memoria (por defecto)
-queue.type: memory
-
-# Logging
-log.level: info
-EOF
-```
-
-3. Crea el índice de destino con configuración de un solo shard:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! -X PUT "https://localhost:9200/labs-benchmark-baseline-$(date +%Y.%m.%d)" \
-  -H 'Content-Type: application/json' -d '{
-  "settings": {
-    "number_of_shards": 1,
-    "number_of_replicas": 0,
-    "refresh_interval": "1s"
-  }
-}'
-```
-
-4. Detén el pipeline actual de Logstash y lanza con la configuración de línea base:
-
-```bash
-# Detener el contenedor actual
-docker stop logstash01
-
-# Lanzar Logstash con la configuración de benchmark
-docker run -d --rm \
-  --name logstash-benchmark \
-  --network elastic-net \
-  -v ~/elastic-labs/lab09/configs/benchmark-baseline.conf:/usr/share/logstash/pipeline/benchmark.conf:ro \
-  -v ~/elastic-labs/lab09/configs/logstash-baseline.yml:/usr/share/logstash/config/logstash.yml:ro \
-  -v ~/elastic-labs/config/certs:/usr/share/logstash/config/certs:ro \
-  -v /tmp/benchmark-app.log:/tmp/benchmark-app.log:ro \
-  -p 9600:9600 \
-  docker.elastic.co/logstash/logstash:8.14.1
-```
-
-5. Espera a que Logstash inicie y verifique el pipeline:
-
-```bash
-# Esperar inicio (30-45 segundos)
-sleep 40
-
-# Verificar que el pipeline está activo
-curl -s http://localhost:9600/_node/stats/pipelines | jq '.pipelines | keys'
-```
-
-**Salida esperada:**
-
-```json
-[
-  "main"
-]
-```
-
-**Verificación:**
-
-```bash
-curl -s http://localhost:9600/_node/stats/pipelines/main | jq '.events'
-```
-
-Debe mostrar los contadores `in`, `out`, `filtered` incrementándose.
-
----
-
-### Paso 3: Medir la línea base de rendimiento
-
-**Objetivo:** Capturar métricas de throughput, latencia y backlog durante la ingestión de los 50.000 eventos con la configuración sin optimizar.
-
-**Instrucciones:**
-
-1. Crea un script de medición automática:
-
-```bash
-cat > ~/elastic-labs/scripts/measure_pipeline.sh << 'SCRIPT'
-#!/bin/bash
-# Script de medición de rendimiento del pipeline de Logstash
-# Uso: ./measure_pipeline.sh <nombre_medicion> <duracion_segundos>
-
-MEASUREMENT_NAME=${1:-"baseline"}
-DURATION=${2:-60}
-OUTPUT_DIR=~/elastic-labs/lab09/results
-LOGSTASH_API="http://localhost:9600"
-ES_API="https://localhost:9200"
-ES_CREDS="elastic:ElasticLabs2024!"
-
-mkdir -p $OUTPUT_DIR
-
-echo "═══════════════════════════════════════════════════"
-echo " Medición: $MEASUREMENT_NAME"
-echo " Duración: ${DURATION}s"
-echo "═══════════════════════════════════════════════════"
-
-# Muestra inicial
-echo "[$(date +%H:%M:%S)] Capturando muestra inicial..."
-STATS_START=$(curl -s ${LOGSTASH_API}/_node/stats/pipelines/main)
-
-EVENTS_IN_START=$(echo $STATS_START | jq '.events.in')
-EVENTS_OUT_START=$(echo $STATS_START | jq '.events.out')
-DURATION_MS_START=$(echo $STATS_START | jq '.events.duration_in_millis')
-QUEUE_EVENTS_START=$(echo $STATS_START | jq '.queue.events_count // 0')
-
-echo "  events.in:  $EVENTS_IN_START"
-echo "  events.out: $EVENTS_OUT_START"
-echo "  queue:      $QUEUE_EVENTS_START eventos"
-
-# Esperar duración de medición
-echo "[$(date +%H:%M:%S)] Midiendo durante ${DURATION}s..."
-sleep $DURATION
-
-# Muestra final
-echo "[$(date +%H:%M:%S)] Capturando muestra final..."
-STATS_END=$(curl -s ${LOGSTASH_API}/_node/stats/pipelines/main)
-
-EVENTS_IN_END=$(echo $STATS_END | jq '.events.in')
-EVENTS_OUT_END=$(echo $STATS_END | jq '.events.out')
-DURATION_MS_END=$(echo $STATS_END | jq '.events.duration_in_millis')
-QUEUE_EVENTS_END=$(echo $STATS_END | jq '.queue.events_count // 0')
-
-echo "  events.in:  $EVENTS_IN_END"
-echo "  events.out: $EVENTS_OUT_END"
-echo "  queue:      $QUEUE_EVENTS_END eventos"
-
-# Calcular métricas
-EVENTS_PROCESSED=$((EVENTS_OUT_END - EVENTS_OUT_START))
-EVENTS_RECEIVED=$((EVENTS_IN_END - EVENTS_IN_START))
-THROUGHPUT_EPS=$((EVENTS_PROCESSED / DURATION))
-BACKLOG=$((EVENTS_IN_END - EVENTS_OUT_END))
-DURATION_DIFF=$((DURATION_MS_END - DURATION_MS_START))
-
-if [ $EVENTS_PROCESSED -gt 0 ]; then
-  LATENCY_AVG_MS=$((DURATION_DIFF / EVENTS_PROCESSED))
-else
-  LATENCY_AVG_MS=0
-fi
-
-# Métricas de Elasticsearch
-ES_INDEX_STATS=$(curl -sk -u $ES_CREDS "${ES_API}/_cat/indices/labs-benchmark-*?format=json&h=index,docs.count,store.size" 2>/dev/null)
-ES_DOCS=$(echo $ES_INDEX_STATS | jq '.[0]["docs.count"] // "0"' -r)
-ES_SIZE=$(echo $ES_INDEX_STATS | jq '.[0]["store.size"] // "0b"' -r)
-
-# Métricas por plugin
-PLUGIN_STATS=$(curl -s ${LOGSTASH_API}/_node/stats/pipelines/main 2>/dev/null)
-FILTER_DURATION=$(echo $PLUGIN_STATS | jq '[.pipelines.main.plugins.filters[].events.duration_in_millis] | add // 0')
-OUTPUT_DURATION=$(echo $PLUGIN_STATS | jq '[.pipelines.main.plugins.outputs[].events.duration_in_millis] | add // 0')
-
-echo ""
-echo "═══════════════════════════════════════════════════"
-echo " RESULTADOS: $MEASUREMENT_NAME"
-echo "═══════════════════════════════════════════════════"
-echo " Throughput:        $THROUGHPUT_EPS EPS"
-echo " Latencia media:    ${LATENCY_AVG_MS} ms/evento"
-echo " Backlog actual:    $BACKLOG eventos"
-echo " Queue size:        $QUEUE_EVENTS_END eventos"
-echo " Eventos recibidos: $EVENTS_RECEIVED"
-echo " Eventos procesados:$EVENTS_PROCESSED"
-echo " ES docs indexados: $ES_DOCS"
-echo " ES tamaño índice:  $ES_SIZE"
-echo " Filter duration:   ${FILTER_DURATION}ms (acum.)"
-echo " Output duration:   ${OUTPUT_DURATION}ms (acum.)"
-echo "═══════════════════════════════════════════════════"
-
-# Guardar resultados en CSV
-RESULT_FILE="${OUTPUT_DIR}/metrics_${MEASUREMENT_NAME}.csv"
-echo "metric,value" > $RESULT_FILE
-echo "throughput_eps,$THROUGHPUT_EPS" >> $RESULT_FILE
-echo "latency_avg_ms,$LATENCY_AVG_MS" >> $RESULT_FILE
-echo "backlog,$BACKLOG" >> $RESULT_FILE
-echo "queue_events,$QUEUE_EVENTS_END" >> $RESULT_FILE
-echo "events_processed,$EVENTS_PROCESSED" >> $RESULT_FILE
-echo "filter_duration_ms,$FILTER_DURATION" >> $RESULT_FILE
-echo "output_duration_ms,$OUTPUT_DURATION" >> $RESULT_FILE
-echo "es_docs,$ES_DOCS" >> $RESULT_FILE
-
-echo ""
-echo "[✓] Resultados guardados en: $RESULT_FILE"
-SCRIPT
-
-chmod +x ~/elastic-labs/scripts/measure_pipeline.sh
-```
-
-2. Ejecuta la medición de línea base (espera a que Logstash esté procesando):
-
-```bash
-# Verificar que hay eventos fluyendo
-curl -s http://localhost:9600/_node/stats/pipelines/main | jq '.events.out'
-
-# Ejecutar medición de 60 segundos
-~/elastic-labs/scripts/measure_pipeline.sh "baseline" 60
-```
-
-3. Captura métricas detalladas por plugin:
-
-```bash
-# Obtener estadísticas detalladas de cada plugin
-curl -s http://localhost:9600/_node/stats/pipelines/main | \
-  jq '{
-    filters: [.pipelines.main.plugins.filters[] | {
-      name: .name,
-      events_in: .events.in,
-      events_out: .events.out,
-      duration_ms: .events.duration_in_millis
-    }],
-    outputs: [.pipelines.main.plugins.outputs[] | {
-      name: .name,
-      events_in: .events.in,
-      events_out: .events.out,
-      duration_ms: .events.duration_in_millis
-    }]
-  }' | tee ~/elastic-labs/lab09/results/plugin_stats_baseline.json
-```
-
-4. Captura estadísticas de indexación de Elasticsearch:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_nodes/stats/indices/indexing" | \
-  jq '.nodes | to_entries[0].value.indices.indexing | {
-    index_total: .index_total,
-    index_time_ms: .index_time_in_millis,
-    index_current: .index_current,
-    avg_ms_per_doc: (if .index_total > 0 then (.index_time_in_millis / .index_total) else 0 end)
-  }' | tee ~/elastic-labs/lab09/results/es_indexing_baseline.json
-```
-
-**Salida esperada (ejemplo):**
-
-```
-═══════════════════════════════════════════════════
- RESULTADOS: baseline
-═══════════════════════════════════════════════════
- Throughput:        850 EPS
- Latencia media:    3 ms/evento
- Backlog actual:    4200 eventos
- Queue size:        312 eventos
- Eventos recibidos: 52100
- Eventos procesados:51000
- ES docs indexados:  48500
- ES tamaño índice:  22.1mb
- Filter duration:   28500ms (acum.)
- Output duration:   142000ms (acum.)
-═══════════════════════════════════════════════════
-```
-
-**Verificación:**
-
-```bash
-# Confirmar que los archivos de resultados existen
-ls -la ~/elastic-labs/lab09/results/
-cat ~/elastic-labs/lab09/results/metrics_baseline.csv
-```
-
----
-
-### Paso 4: Identificar cuellos de botella
-
-**Objetivo:** Analizar las métricas recolectadas para determinar si el cuello de botella está en el input, filter u output del pipeline.
-
-**Instrucciones:**
-
-1. Analiza la distribución del tiempo por etapa:
-
-```bash
-# Obtener tiempos acumulados por etapa
-curl -s http://localhost:9600/_node/stats/pipelines/main | \
-  python3 -c "
-import sys, json
-
-data = json.load(sys.stdin)
-pipeline = data.get('pipelines', {}).get('main', data)
-
-# Tiempos por plugin
-filters = pipeline.get('plugins', {}).get('filters', [])
-outputs = pipeline.get('plugins', {}).get('outputs', [])
-
-print('=' * 60)
-print(' ANÁLISIS DE CUELLOS DE BOTELLA')
-print('=' * 60)
-
-total_filter_ms = 0
-print('\n FILTROS:')
-print(f' {\"Plugin\":<20} {\"Eventos\":<12} {\"Duración(ms)\":<15} {\"ms/evento\":<10}')
-print(' ' + '-' * 57)
-for f in filters:
-    dur = f['events']['duration_in_millis']
-    evts = f['events']['out']
-    avg = dur / evts if evts > 0 else 0
-    total_filter_ms += dur
-    print(f' {f[\"name\"]:<20} {evts:<12} {dur:<15} {avg:<10.3f}')
-
-total_output_ms = 0
-print('\n OUTPUTS:')
-print(f' {\"Plugin\":<20} {\"Eventos\":<12} {\"Duración(ms)\":<15} {\"ms/evento\":<10}')
-print(' ' + '-' * 57)
-for o in outputs:
-    dur = o['events']['duration_in_millis']
-    evts = o['events']['out']
-    avg = dur / evts if evts > 0 else 0
-    total_output_ms += dur
-    print(f' {o[\"name\"]:<20} {evts:<12} {dur:<15} {avg:<10.3f}')
-
-total = total_filter_ms + total_output_ms
-print(f'\n RESUMEN:')
-print(f'   Tiempo total filtros: {total_filter_ms}ms ({total_filter_ms*100//total if total>0 else 0}%)')
-print(f'   Tiempo total outputs: {total_output_ms}ms ({total_output_ms*100//total if total>0 else 0}%)')
-
-if total_output_ms > total_filter_ms * 2:
-    print('\n ⚠️  CUELLO DE BOTELLA: OUTPUT (Elasticsearch bulk indexing)')
-    print('    → Recomendación: aumentar batch_size, habilitar compresión HTTP')
-elif total_filter_ms > total_output_ms * 2:
-    print('\n ⚠️  CUELLO DE BOTELLA: FILTROS (procesamiento)')
-    print('    → Recomendación: aumentar workers, simplificar filtros')
-else:
-    print('\n ℹ️  Distribución equilibrada entre filtros y output')
-    print('    → Recomendación: aumentar workers y batch_size simultáneamente')
-print('=' * 60)
-"
-```
-
-2. Verifica el thread pool de Elasticsearch para detectar rechazos:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/thread_pool/write?v&h=node_name,name,active,queue,rejected,completed"
-```
-
-3. Verifica la presión de memoria del heap de Elasticsearch:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_nodes/stats/jvm" | \
-  jq '.nodes | to_entries[0].value.jvm | {
-    heap_used_percent: .mem.heap_used_percent,
-    heap_used: .mem.heap_used_in_bytes,
-    heap_max: .mem.heap_max_in_bytes,
-    gc_old_count: .gc.collectors.old.collection_count,
-    gc_old_time_ms: .gc.collectors.old.collection_time_in_millis
-  }'
-```
-
-4. Documenta los hallazgos:
-
-```bash
-cat > ~/elastic-labs/lab09/results/bottleneck_analysis.md << 'EOF'
-# Análisis de Cuellos de Botella - Línea Base
-
-## Hallazgos
-
-| Componente | Tiempo acumulado | % del total | Diagnóstico |
-|-----------|-----------------|-------------|-------------|
-| Filtros (mutate, date) | Ver medición | Ver % | Normal/Lento |
-| Output (elasticsearch) | Ver medición | Ver % | Normal/Lento |
-
-## Cuello de botella identificado
-
-**Componente:** (completar con resultado del análisis)
-
-**Causa probable:** Con 1 worker y batch_size 125, Logstash envía
-lotes pequeños a Elasticsearch, incrementando el overhead de cada
-operación bulk. Además, sin compresión HTTP, el payload es más grande.
-
-## Optimizaciones propuestas
-
-1. Aumentar `pipeline.workers` de 1 a 4
-2. Aumentar `pipeline.batch.size` de 125 a 500
-3. Habilitar `http_compression => true` en el output
-4. Mantener 1 shard (entorno de nodo único)
-EOF
-
-echo "[✓] Análisis documentado en ~/elastic-labs/lab09/results/bottleneck_analysis.md"
-```
-
-**Salida esperada:**
-
-El análisis debe revelar que el output de Elasticsearch consume entre 60-80% del tiempo total de procesamiento, indicando que el cuello de botella principal está en la comunicación con Elasticsearch (lotes pequeños, sin compresión).
-
-**Verificación:**
-
-```bash
-# El thread pool de write no debe mostrar rechazos (rejected = 0)
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/thread_pool/write?v&h=name,active,queue,rejected" | grep write
-```
-
----
-
-### Paso 5: Aplicar optimizaciones al pipeline
-
-**Objetivo:** Reconfigurar Logstash con parámetros optimizados y medir la mejora de rendimiento.
-
-**Instrucciones:**
-
-1. Detén el pipeline de línea base:
-
-```bash
-docker stop logstash-benchmark
-```
-
-2. Limpia los datos de estado para repetir la ingestión:
-
-```bash
-# Eliminar sincedb para que Logstash relea el archivo
-rm -f /tmp/sincedb_benchmark
-
-# Eliminar el índice de línea base
-curl -sk -u elastic:ElasticLabs2024! -X DELETE \
-  "https://localhost:9200/labs-benchmark-baseline-*"
-
-# Regenerar el archivo de log (mismo contenido, nuevo archivo)
-rm -f /tmp/benchmark-app.log
-python3 ~/elastic-labs/scripts/benchmark_log_generator.py
-```
-
-3. Crea la configuración optimizada de Logstash:
-
-```bash
-cat > ~/elastic-labs/lab09/configs/logstash-optimized.yml << 'EOF'
-# Configuración OPTIMIZADA
-pipeline.workers: 4
-pipeline.batch.size: 500
-pipeline.batch.delay: 50
-
-# Monitoreo habilitado
-api.http.host: "0.0.0.0"
-api.http.port: 9600
-
-# Cola en memoria (suficiente para este benchmark)
-queue.type: memory
-
-# Logging
-log.level: info
-EOF
-```
-
-4. Crea el pipeline optimizado:
-
-```bash
-cat > ~/elastic-labs/lab09/configs/benchmark-optimized.conf << 'EOF'
-input {
-  file {
-    path => "/tmp/benchmark-app.log"
-    start_position => "beginning"
-    sincedb_path => "/tmp/sincedb_benchmark_opt"
-    codec => "json"
-    mode => "read"
-    file_completed_action => "log"
-    file_completed_log_path => "/tmp/file_completed_opt.log"
-  }
+**Qué hace y por qué:** toda consulta cuya fase *query* tarde más de
+50 ms se registra con nivel INFO, y más de 500 ms con WARN, incluido el
+texto completo de la consulta. Los umbrales tan bajos son solo para el
+laboratorio; en producción se usan valores de segundos.
+
+#### Paso 16. Ejecuta la consulta lenta del dashboard
+
+``` 
+GET logs-mercanova.web-default/_search
+{
+  "size": 0,
+  "profile": true,
+  "query": { "bool": { "filter": [
+    { "wildcard": { "url.original": "*checkout*" } },
+    { "range": { "http.response.status_code": { "gte": 500 } } }
+  ] } }
 }
+```
 
-filter {
-  # Optimización: el codec json ya parsea, no necesitamos grok
-  # Solo enriquecimiento necesario
-  mutate {
-    add_field => {
-      "[@metadata][pipeline]" => "benchmark-optimized"
-      "[event][dataset]" => "benchmark.app"
-    }
-  }
+``` 
+$ sudo grep -h checkout /opt/elastic/es0[12]/logs/\
+mercanova-lab_index_search_slowlog.json | tail -1 | jq -c \
+  '{took: ."elasticsearch.slowlog.took"}'
+```
 
-  # Parseo de timestamp (necesario para @timestamp correcto)
-  date {
-    match => ["@timestamp", "ISO8601"]
-    target => "@timestamp"
-  }
+**Qué hace y por qué:** `"profile": true` agrega a la respuesta el tiempo
+de cada componente de la consulta por shard. Observa que el
+`WildcardQuery` sobre `url.original` es, por mucho, el componente más
+costoso: un comodín **al inicio** obliga a recorrer todos los términos
+del campo. El slow log, en el nodo que tiene el shard, muestra la misma
+consulta con su duración.
 
-  # Clasificación por nivel (optimizado con condicional simple)
-  if [level] == "ERROR" {
-    mutate { add_tag => ["high_priority"] }
-  } else if [level] == "WARN" {
-    mutate { add_tag => ["medium_priority"] }
-  }
+#### Paso 17. Corrige la consulta
 
-  # Conversión de tipos en un solo bloque mutate (más eficiente)
-  mutate {
-    convert => {
-      "response_time_ms" => "integer"
-      "bytes_sent" => "integer"
-      "sequence" => "integer"
-    }
-  }
+``` 
+GET logs-mercanova.web-default/_search
+{
+  "size": 0,
+  "profile": true,
+  "query": { "bool": { "filter": [
+    { "terms": { "url.path": [ "/api/checkout" ] } },
+    { "range": { "http.response.status_code": { "gte": 500 } } }
+  ] } }
 }
+```
 
-output {
-  elasticsearch {
-    hosts => ["https://es01:9200"]
-    user => "elastic"
-    password => "ElasticLabs2024!"
-    ssl_certificate_authorities => ["/usr/share/logstash/config/certs/ca/ca.crt"]
-    index => "labs-benchmark-optimized-%{+YYYY.MM.dd}"
-    # OPTIMIZACIÓN: compresión HTTP
-    http_compression => true
-  }
+**Qué hace y por qué:** como en la práctica 5 se separó `url.path` como
+`keyword`, la pregunta "errores de checkout" se responde con un `terms`
+exacto, que es una búsqueda directa en el índice invertido. Compara en
+**Dev Tools \> Search Profiler** ambas versiones: la segunda es varias
+veces más rápida y devuelve el mismo conteo (190). **Lección:** el mejor
+optimizador de consultas es un buen mapping.
+
+#### Paso 18. Restablece los umbrales
+
+``` 
+PUT logs-mercanova.web-default/_settings
+{
+  "index.search.slowlog.threshold.query.warn": "2s",
+  "index.search.slowlog.threshold.query.info": null,
+  "index.search.slowlog.threshold.fetch.info": null
 }
-EOF
 ```
 
-5. Crea el índice optimizado:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! -X PUT \
-  "https://localhost:9200/labs-benchmark-optimized-$(date +%Y.%m.%d)" \
-  -H 'Content-Type: application/json' -d '{
-  "settings": {
-    "number_of_shards": 1,
-    "number_of_replicas": 0,
-    "refresh_interval": "5s",
-    "index.translog.durability": "async",
-    "index.translog.sync_interval": "5s"
-  }
-}'
-```
-
-6. Lanza Logstash con la configuración optimizada:
-
-```bash
-docker run -d --rm \
-  --name logstash-benchmark-opt \
-  --network elastic-net \
-  -v ~/elastic-labs/lab09/configs/benchmark-optimized.conf:/usr/share/logstash/pipeline/benchmark.conf:ro \
-  -v ~/elastic-labs/lab09/configs/logstash-optimized.yml:/usr/share/logstash/config/logstash.yml:ro \
-  -v ~/elastic-labs/config/certs:/usr/share/logstash/config/certs:ro \
-  -v /tmp/benchmark-app.log:/tmp/benchmark-app.log:ro \
-  -p 9600:9600 \
-  docker.elastic.co/logstash/logstash:8.14.1
-
-# Esperar inicio
-sleep 40
-```
-
-7. Ejecuta la medición optimizada:
-
-```bash
-~/elastic-labs/scripts/measure_pipeline.sh "optimized" 60
-```
-
-8. Captura las estadísticas por plugin de la versión optimizada:
-
-```bash
-curl -s http://localhost:9600/_node/stats/pipelines/main | \
-  jq '{
-    filters: [.pipelines.main.plugins.filters[] | {
-      name: .name,
-      events_out: .events.out,
-      duration_ms: .events.duration_in_millis
-    }],
-    outputs: [.pipelines.main.plugins.outputs[] | {
-      name: .name,
-      events_out: .events.out,
-      duration_ms: .events.duration_in_millis
-    }]
-  }' | tee ~/elastic-labs/lab09/results/plugin_stats_optimized.json
-```
-
-**Salida esperada:**
-
-El throughput optimizado debe ser significativamente mayor que la línea base:
-
-```
-═══════════════════════════════════════════════════
- RESULTADOS: optimized
-═══════════════════════════════════════════════════
- Throughput:        3200 EPS    (vs 850 EPS baseline = +276%)
- Latencia media:    1 ms/evento (vs 3 ms baseline)
- Backlog actual:    200 eventos (vs 4200 baseline)
- ...
-═══════════════════════════════════════════════════
-```
-
-**Verificación:**
-
-```bash
-# Verificar que todos los 50000 eventos fueron indexados
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-benchmark-optimized-*/_count" | jq '.count'
-```
-
-El count debe ser 50000 (o muy cercano si la ingestión aún está en curso).
-
----
-
-### Paso 6: Comparar rendimiento con Filebeat
-
-**Objetivo:** Desplegar Filebeat apuntando al mismo archivo de log y medir su throughput y latencia para comparar con Logstash.
-
-**Instrucciones:**
-
-1. Detén el pipeline optimizado de Logstash:
-
-```bash
-docker stop logstash-benchmark-opt
-```
-
-2. Regenera el archivo de benchmark:
-
-```bash
-rm -f /tmp/benchmark-app.log
-python3 ~/elastic-labs/scripts/benchmark_log_generator.py
-```
-
-3. Crea la configuración de Filebeat:
-
-```bash
-cat > ~/elastic-labs/lab09/configs/filebeat-benchmark.yml << 'EOF'
-filebeat.inputs:
-  - type: log
-    enabled: true
-    paths:
-      - /tmp/benchmark-app.log
-    json.keys_under_root: true
-    json.overwrite_keys: true
-    json.add_error_key: true
-
-# Métricas HTTP habilitadas
-http.enabled: true
-http.host: "0.0.0.0"
-http.port: 5066
-
-# Output directo a Elasticsearch
-output.elasticsearch:
-  hosts: ["https://es01:9200"]
-  username: "elastic"
-  password: "ElasticLabs2024!"
-  ssl.certificate_authorities: ["/usr/share/filebeat/config/certs/ca/ca.crt"]
-  index: "labs-benchmark-filebeat-%{+yyyy.MM.dd}"
-  # Configuración de rendimiento
-  bulk_max_size: 500
-  worker: 4
-  compression_level: 3
-
-setup.ilm.enabled: false
-setup.template.enabled: false
-
-# Logging
-logging.level: info
-logging.to_stderr: true
-EOF
-```
-
-4. Crea el índice de destino para Filebeat:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! -X PUT \
-  "https://localhost:9200/labs-benchmark-filebeat-$(date +%Y.%m.%d)" \
-  -H 'Content-Type: application/json' -d '{
-  "settings": {
-    "number_of_shards": 1,
-    "number_of_replicas": 0,
-    "refresh_interval": "5s"
-  }
-}'
-```
-
-5. Lanza Filebeat como contenedor:
-
-```bash
-docker run -d --rm \
-  --name filebeat-benchmark \
-  --network elastic-net \
-  -v ~/elastic-labs/lab09/configs/filebeat-benchmark.yml:/usr/share/filebeat/filebeat.yml:ro \
-  -v ~/elastic-labs/config/certs:/usr/share/filebeat/config/certs:ro \
-  -v /tmp/benchmark-app.log:/tmp/benchmark-app.log:ro \
-  -p 5066:5066 \
-  docker.elastic.co/beats/filebeat:8.14.1
-```
-
-6. Espera a que Filebeat inicie y mide el rendimiento:
-
-```bash
-sleep 20
-
-# Crear script de medición para Filebeat
-cat > ~/elastic-labs/scripts/measure_filebeat.sh << 'FBSCRIPT'
-#!/bin/bash
-DURATION=${1:-60}
-ES_API="https://localhost:9200"
-ES_CREDS="elastic:ElasticLabs2024!"
-FB_API="http://localhost:5066"
-
-echo "═══════════════════════════════════════════════════"
-echo " Medición Filebeat - ${DURATION}s"
-echo "═══════════════════════════════════════════════════"
-
-# Muestra inicial de documentos en ES
-DOCS_START=$(curl -sk -u $ES_CREDS "${ES_API}/labs-benchmark-filebeat-*/_count" 2>/dev/null | jq '.count // 0')
-echo "[$(date +%H:%M:%S)] Docs iniciales en ES: $DOCS_START"
-
-# Métricas de Filebeat
-FB_STATS_START=$(curl -s ${FB_API}/stats 2>/dev/null)
-FB_EVENTS_START=$(echo $FB_STATS_START | jq '.libbeat.output.events.total // 0')
-
-sleep $DURATION
-
-# Muestra final
-DOCS_END=$(curl -sk -u $ES_CREDS "${ES_API}/labs-benchmark-filebeat-*/_count" 2>/dev/null | jq '.count // 0')
-FB_STATS_END=$(curl -s ${FB_API}/stats 2>/dev/null)
-FB_EVENTS_END=$(echo $FB_STATS_END | jq '.libbeat.output.events.total // 0')
-FB_ACKED=$(echo $FB_STATS_END | jq '.libbeat.output.events.acked // 0')
-FB_FAILED=$(echo $FB_STATS_END | jq '.libbeat.output.events.failed // 0')
-
-DOCS_INDEXED=$((DOCS_END - DOCS_START))
-THROUGHPUT=$((DOCS_INDEXED / DURATION))
-FB_EVENTS_SENT=$((FB_EVENTS_END - FB_EVENTS_START))
-
-echo "[$(date +%H:%M:%S)] Docs finales en ES: $DOCS_END"
-echo ""
-echo "═══════════════════════════════════════════════════"
-echo " RESULTADOS FILEBEAT"
-echo "═══════════════════════════════════════════════════"
-echo " Throughput (ES):     $THROUGHPUT EPS"
-echo " Docs indexados:      $DOCS_INDEXED"
-echo " Eventos enviados FB: $FB_EVENTS_SENT"
-echo " Total acked:         $FB_ACKED"
-echo " Total failed:        $FB_FAILED"
-echo "═══════════════════════════════════════════════════"
-
-# Guardar
-echo "metric,value" > ~/elastic-labs/lab09/results/metrics_filebeat.csv
-echo "throughput_eps,$THROUGHPUT" >> ~/elastic-labs/lab09/results/metrics_filebeat.csv
-echo "docs_indexed,$DOCS_INDEXED" >> ~/elastic-labs/lab09/results/metrics_filebeat.csv
-echo "events_acked,$FB_ACKED" >> ~/elastic-labs/lab09/results/metrics_filebeat.csv
-echo "events_failed,$FB_FAILED" >> ~/elastic-labs/lab09/results/metrics_filebeat.csv
-
-echo "[✓] Resultados guardados"
-FBSCRIPT
-
-chmod +x ~/elastic-labs/scripts/measure_filebeat.sh
-~/elastic-labs/scripts/measure_filebeat.sh 60
-```
-
-**Salida esperada:**
-
-```
-═══════════════════════════════════════════════════
- RESULTADOS FILEBEAT
-═══════════════════════════════════════════════════
- Throughput (ES):     4500 EPS
- Docs indexados:      50000
- Eventos enviados FB: 50000
- Total acked:         50000
- Total failed:        0
-═══════════════════════════════════════════════════
-```
-
-**Verificación:**
-
-```bash
-# Confirmar total de documentos indexados
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-benchmark-filebeat-*/_count" | jq '.count'
-```
-
----
-
-### Paso 7: Generar tabla comparativa y documentar resultados
-
-**Objetivo:** Consolidar todas las métricas en una tabla comparativa y documentar las conclusiones.
-
-**Instrucciones:**
-
-1. Genera el informe comparativo:
-
-```bash
-cat > ~/elastic-labs/scripts/generate_report.py << 'EOF'
-#!/usr/bin/env python3
-"""Genera informe comparativo de rendimiento."""
-import csv
-import os
-
-RESULTS_DIR = os.path.expanduser("~/elastic-labs/lab09/results")
-
-def load_metrics(filename):
-    """Carga métricas desde CSV."""
-    filepath = os.path.join(RESULTS_DIR, filename)
-    metrics = {}
-    if os.path.exists(filepath):
-        with open(filepath) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                metrics[row['metric']] = row['value']
-    return metrics
-
-baseline = load_metrics("metrics_baseline.csv")
-optimized = load_metrics("metrics_optimized.csv")
-filebeat = load_metrics("metrics_filebeat.csv")
-
-report = f"""
-# Informe Comparativo de Rendimiento - Lab 09
-
-## Fecha: {os.popen('date +%Y-%m-%d').read().strip()}
-
-## Configuración del Test
-
-| Parámetro | Valor |
-|-----------|-------|
-| Total eventos | 50,000 |
-| Tasa de generación | 1,000 EPS |
-| Formato | JSON (13 campos por evento) |
-| Índice: shards | 1 |
-| Índice: réplicas | 0 |
-
-## Tabla Comparativa
-
-| Métrica | Baseline (1w/125b) | Optimizado (4w/500b) | Filebeat (4w/500b) |
-|---------|--------------------:|---------------------:|-------------------:|
-| Throughput (EPS) | {baseline.get('throughput_eps', 'N/A')} | {optimized.get('throughput_eps', 'N/A')} | {filebeat.get('throughput_eps', 'N/A')} |
-| Latencia media (ms) | {baseline.get('latency_avg_ms', 'N/A')} | {optimized.get('latency_avg_ms', 'N/A')} | N/A (directo) |
-| Backlog (eventos) | {baseline.get('backlog', 'N/A')} | {optimized.get('backlog', 'N/A')} | 0 (sin cola) |
-| Filter duration (ms) | {baseline.get('filter_duration_ms', 'N/A')} | {optimized.get('filter_duration_ms', 'N/A')} | N/A |
-| Output duration (ms) | {baseline.get('output_duration_ms', 'N/A')} | {optimized.get('output_duration_ms', 'N/A')} | N/A |
-
-## Optimizaciones Aplicadas
-
-| # | Optimización | Impacto esperado |
-|---|-------------|-----------------|
-| 1 | `pipeline.workers`: 1 → 4 | Paralelización del procesamiento de filtros |
-| 2 | `pipeline.batch.size`: 125 → 500 | Menos operaciones bulk, mayor eficiencia |
-| 3 | `http_compression: true` | Reduce tráfico de red ~60-70% |
-| 4 | `refresh_interval`: 1s → 5s | Menos refreshes, más throughput de indexación |
-| 5 | `translog.durability`: async | Reduce latencia de escritura en disco |
-
-## Conclusiones
-
-1. **Logstash optimizado vs baseline**: El aumento de workers y batch_size
-   produce una mejora significativa en throughput (esperado 2-4x).
-
-2. **Filebeat vs Logstash**: Filebeat sin procesamiento intermedio logra
-   mayor throughput al enviar directamente a Elasticsearch, eliminando
-   la latencia de procesamiento de filtros.
-
-3. **Trade-offs**:
-   - Filebeat no permite transformaciones complejas (grok, enrich)
-   - Logstash ofrece flexibilidad a costa de latencia adicional
-   - Para logs pre-formateados en JSON, Filebeat es más eficiente
-   - Para logs que requieren parsing, Logstash es necesario
-
-4. **Cuello de botella principal**: El output a Elasticsearch (bulk indexing)
-   es típicamente el factor limitante en entornos de nodo único.
-"""
-
-report_path = os.path.join(RESULTS_DIR, "informe_comparativo.md")
-with open(report_path, "w") as f:
-    f.write(report)
-
-print(report)
-print(f"\n[✓] Informe guardado en: {report_path}")
-EOF
-
-python3 ~/elastic-labs/scripts/generate_report.py
-```
-
-2. Verifica todos los índices de benchmark creados:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-benchmark-*?v&h=index,docs.count,store.size,pri.store.size&s=index"
-```
-
-**Salida esperada:**
-
-```
-index                                    docs.count store.size pri.store.size
-labs-benchmark-filebeat-2024.XX.XX       50000      22.5mb     22.5mb
-labs-benchmark-optimized-2024.XX.XX      50000      22.1mb     22.1mb
-```
-
-**Verificación:**
-
-```bash
-# Verificar que el informe existe y tiene contenido
-wc -l ~/elastic-labs/lab09/results/informe_comparativo.md
-cat ~/elastic-labs/lab09/results/informe_comparativo.md | head -30
-```
-
----
-
-## Validación y Pruebas
-
-Ejecuta las siguientes verificaciones para confirmar que el laboratorio se completó correctamente:
-
-```bash
-echo "═══════════════════════════════════════════════════"
-echo " VALIDACIÓN FINAL DEL LABORATORIO 09"
-echo "═══════════════════════════════════════════════════"
-
-PASS=0
-FAIL=0
-
-# Test 1: Archivo de benchmark generado
-if [ -f /tmp/benchmark-app.log ] && [ $(wc -l < /tmp/benchmark-app.log) -eq 50000 ]; then
-  echo "✅ Test 1: Archivo de benchmark con 50,000 eventos"
-  ((PASS++))
-else
-  echo "❌ Test 1: Archivo de benchmark incorrecto"
-  ((FAIL++))
-fi
-
-# Test 2: Métricas de línea base capturadas
-if [ -f ~/elastic-labs/lab09/results/metrics_baseline.csv ]; then
-  echo "✅ Test 2: Métricas de línea base registradas"
-  ((PASS++))
-else
-  echo "❌ Test 2: Faltan métricas de línea base"
-  ((FAIL++))
-fi
-
-# Test 3: Métricas optimizadas capturadas
-if [ -f ~/elastic-labs/lab09/results/metrics_optimized.csv ]; then
-  echo "✅ Test 3: Métricas optimizadas registradas"
-  ((PASS++))
-else
-  echo "❌ Test 3: Faltan métricas optimizadas"
-  ((FAIL++))
-fi
-
-# Test 4: Métricas de Filebeat capturadas
-if [ -f ~/elastic-labs/lab09/results/metrics_filebeat.csv ]; then
-  echo "✅ Test 4: Métricas de Filebeat registradas"
-  ((PASS++))
-else
-  echo "❌ Test 4: Faltan métricas de Filebeat"
-  ((FAIL++))
-fi
-
-# Test 5: Índices de benchmark existen en Elasticsearch
-INDICES=$(curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-benchmark-*?h=index" 2>/dev/null | wc -l)
-if [ $INDICES -ge 2 ]; then
-  echo "✅ Test 5: Al menos 2 índices de benchmark en Elasticsearch"
-  ((PASS++))
-else
-  echo "❌ Test 5: Índices de benchmark insuficientes ($INDICES)"
-  ((FAIL++))
-fi
-
-# Test 6: Informe comparativo generado
-if [ -f ~/elastic-labs/lab09/results/informe_comparativo.md ]; then
-  echo "✅ Test 6: Informe comparativo generado"
-  ((PASS++))
-else
-  echo "❌ Test 6: Falta informe comparativo"
-  ((FAIL++))
-fi
-
-# Test 7: Throughput optimizado > baseline
-if [ -f ~/elastic-labs/lab09/results/metrics_baseline.csv ] && \
-   [ -f ~/elastic-labs/lab09/results/metrics_optimized.csv ]; then
-  BASELINE_T=$(grep throughput ~/elastic-labs/lab09/results/metrics_baseline.csv | cut -d',' -f2)
-  OPTIMIZED_T=$(grep throughput ~/elastic-labs/lab09/results/metrics_optimized.csv | cut -d',' -f2)
-  if [ "${OPTIMIZED_T:-0}" -gt "${BASELINE_T:-0}" ]; then
-    echo "✅ Test 7: Throughput optimizado ($OPTIMIZED_T) > baseline ($BASELINE_T)"
-    ((PASS++))
-  else
-    echo "❌ Test 7: No se observó mejora de throughput"
-    ((FAIL++))
-  fi
-else
-  echo "❌ Test 7: No se pueden comparar (faltan archivos)"
-  ((FAIL++))
-fi
-
-echo ""
-echo "═══════════════════════════════════════════════════"
-echo " Resultado: $PASS/7 pruebas pasadas, $FAIL fallidas"
-echo "═══════════════════════════════════════════════════"
-```
-
-## Solución de Problemas
-
-### Problema 1: Logstash no procesa eventos (throughput = 0)
-
-**Síntomas:**
-- La API `/_node/stats` muestra `events.in: 0` y `events.out: 0`
-- El archivo de log existe y tiene contenido
-- No hay errores visibles en los logs de Logstash
-
-**Causa:**
-El archivo `sincedb` de una ejecución anterior registra que el archivo ya fue leído completamente. El plugin `file` de Logstash usa el sincedb para rastrear la posición de lectura y no releerá un archivo ya procesado.
-
-**Solución:**
-
-```bash
-# Eliminar archivos sincedb
-rm -f /tmp/sincedb_benchmark*
-
-# Verificar que el archivo de log existe y tiene contenido
-wc -l /tmp/benchmark-app.log
-
-# Reiniciar el contenedor de Logstash
-docker restart logstash-benchmark
-
-# Si persiste, verificar permisos del volumen montado
-docker exec logstash-benchmark ls -la /tmp/benchmark-app.log
-
-# Verificar logs de Logstash para errores de acceso
-docker logs logstash-benchmark --tail 50 | grep -i "error\|permission\|cannot"
-```
-
----
-
-### Problema 2: Filebeat no envía eventos a Elasticsearch (events_failed > 0)
-
-**Síntomas:**
-- El endpoint `http://localhost:5066/stats` muestra `output.events.failed > 0`
-- El índice `labs-benchmark-filebeat-*` tiene 0 documentos
-- Los logs de Filebeat muestran errores de conexión TLS o autenticación
-
-**Causa:**
-Filebeat no puede verificar el certificado TLS de Elasticsearch porque la ruta al certificado CA está incorrecta dentro del contenedor, o las credenciales son incorrectas. En entornos Docker, las rutas de volúmenes montados deben coincidir exactamente con la configuración.
-
-**Solución:**
-
-```bash
-# Verificar logs de Filebeat
-docker logs filebeat-benchmark --tail 30 | grep -i "error\|tls\|auth"
-
-# Verificar que el certificado CA está accesible dentro del contenedor
-docker exec filebeat-benchmark ls -la /usr/share/filebeat/config/certs/ca/ca.crt
-
-# Si el archivo no existe, verificar el montaje de volumen
-docker inspect filebeat-benchmark | jq '.[0].Mounts'
-
-# Probar conectividad desde dentro del contenedor
-docker exec filebeat-benchmark curl -sk \
-  -u elastic:ElasticLabs2024! \
-  https://es01:9200/_cluster/health
-
-# Si hay error de resolución DNS, verificar la red
-docker exec filebeat-benchmark cat /etc/hosts
-docker network inspect elastic-net | jq '.[0].Containers'
-
-# Reconstruir con la ruta correcta si es necesario
-docker stop filebeat-benchmark
-# Ajustar la ruta en filebeat-benchmark.yml y relanzar
-```
-
-## Limpieza
-
-```bash
-echo "[*] Limpiando recursos del Lab 09..."
-
-# Detener contenedores de benchmark
-docker stop logstash-benchmark logstash-benchmark-opt filebeat-benchmark 2>/dev/null
-
-# Eliminar índices de benchmark
-curl -sk -u elastic:ElasticLabs2024! -X DELETE \
-  "https://localhost:9200/labs-benchmark-*" 2>/dev/null
-echo ""
-
-# Limpiar archivos temporales
-rm -f /tmp/benchmark-app.log
-rm -f /tmp/sincedb_benchmark*
-rm -f /tmp/file_completed*.log
-
-# Reiniciar Logstash original
-docker start logstash01
-
-# Verificar que el stack vuelve a estado normal
-sleep 10
-docker compose -f ~/elastic-labs/docker-compose.yml ps --format "table {{.Name}}\t{{.Status}}"
-
-echo ""
-echo "[✓] Limpieza completada. Stack restaurado a estado pre-laboratorio."
-echo "[ℹ] Los resultados se conservan en ~/elastic-labs/lab09/results/"
-```
-
-## Resumen
-
-En este laboratorio completaste un ciclo completo de benchmark y optimización de un pipeline de ingestión:
-
-| Fase | Actividad realizada |
-|------|-------------------|
-| **Generación de carga** | Script Python con faker generando 50,000 eventos JSON a 1,000 EPS |
-| **Línea base** | Medición con 1 worker, batch_size 125, sin compresión |
-| **Análisis** | Identificación del output como cuello de botella mediante API de monitoreo |
-| **Optimización** | 4 workers, batch_size 500, compresión HTTP, refresh_interval 5s |
-| **Comparativa** | Filebeat directo vs Logstash con procesamiento |
-
-**Lecciones clave:**
-
-1. El throughput del pipeline está limitado por su componente más lento (típicamente el output a Elasticsearch en nodo único)
-2. Aumentar `pipeline.workers` y `pipeline.batch.size` produce mejoras significativas cuando el cuello de botella es el output
-3. La compresión HTTP reduce la carga de red y mejora el throughput, especialmente con logs JSON verbosos
-4. Filebeat sin procesamiento intermedio supera a Logstash en throughput puro, pero carece de capacidades de transformación
-5. Las métricas deben interpretarse conjuntamente: throughput, latencia y backlog forman un sistema interdependiente
-
-### Recursos adicionales
-
-- [Logstash Performance Tuning](https://www.elastic.co/guide/en/logstash/current/performance-troubleshooting.html)
-- [Tune for Indexing Speed - Elasticsearch](https://www.elastic.co/guide/en/elasticsearch/reference/current/tune-for-indexing-speed.html)
-- [Filebeat Performance Tips](https://www.elastic.co/guide/en/beats/filebeat/current/filebeat-performance.html)
-- [Logstash Monitoring API Reference](https://www.elastic.co/guide/en/logstash/current/monitoring-logstash.html)
+**Qué hace y por qué:** `null` regresa un ajuste a su valor por defecto
+(deshabilitado). Se conserva un umbral de advertencia razonable de 2 s.
+
+### Resultado esperado
+
+-   Stack Monitoring muestra los 3 nodos, Kibana y Logstash.
+-   Tabla de resultados completa con el efecto de cada ajuste; el
+    throughput final es claramente superior a la línea base.
+-   Puedes señalar el filtro más costoso con la API de Logstash y
+    explicar por qué dissect es más rápido que grok.
+-   La consulta con `wildcard` aparece en el slow log y la versión con
+    `terms` sobre `url.path` es varias veces más rápida.
+-   Puedes explicar cuándo conviene aumentar workers, lote o refresh y
+    qué se sacrifica en cada caso.
+
+### Referencias
+
+-   Elastic. *Collecting monitoring data with Metricbeat \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/configuring-metricbeat.html>
+-   Elastic. *Tuning and profiling Logstash performance \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/tuning-logstash.html>
+-   Elastic. *Logstash: Dissect filter plugin \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/plugins-filters-dissect.html>
+-   Elastic. *Tune for indexing speed \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/tune-for-indexing-speed.html>
+-   Elastic. *Slow log \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/index-modules-slowlog.html>
+-   Elastic. *Profile API \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/search-profile.html>
