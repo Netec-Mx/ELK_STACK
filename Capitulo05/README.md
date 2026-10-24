@@ -1,777 +1,536 @@
-# Crear un dashboard de errores y configurar una regla de monitoreo para logs de aplicaciones
+# ELK Stack: Elasticsearch, Logstash y Kibana
 
-## Metadatos
+## Práctica 5. Construir un pipeline para logs web y datos de pedidos
 
-| Campo | Valor |
-|-------|-------|
-| **Duración** | 54 minutos |
-| **Complejidad** | Alta |
-| **Nivel Bloom** | Crear |
+### Objetivo
 
-## Descripción General
+Al finalizar la práctica, serás capaz de:
 
-En esta práctica integradora final, construirás un dashboard operativo completo en Kibana para monitorear errores de aplicaciones, utilizando los datos generados en las prácticas anteriores (1, 3 y 4). Explorarás los datos con KQL y ES|QL en Discover, crearás cinco visualizaciones con Lens y configurarás una regla de alerta que detecte picos de errores y notifique mediante un conector de tipo Server log. Validarás el funcionamiento completo generando un pico artificial de errores con un script Python.
+-   Desarrollar y depurar un patrón grok con Grok Debugger y la salida
+    `rubydebug`.
+-   Construir un pipeline de Logstash que estructure, enriquezca y envíe
+    logs de Nginx a un data stream.
+-   Leer una base de datos MariaDB (compatible con MySQL) de forma
+    incremental con el input JDBC.
+-   Ejecutar varios pipelines independientes con `pipelines.yml` y
+    autenticar Logstash con una API key.
 
-## Objetivos de Aprendizaje
+### Objetivo visual
 
-- [ ] Crear un dashboard operativo en Kibana con al menos cinco visualizaciones Lens (métrica, barras apiladas, tabla, mapa, líneas) que muestren distribución de errores, tendencias temporales y distribución geográfica.
-- [ ] Escribir consultas KQL y ES|QL en Kibana Discover para filtrar y analizar patrones específicos de error en logs indexados.
-- [ ] Configurar una regla de alerta de tipo "Elasticsearch query" con umbral de picos de errores y validar su disparo mediante generación controlada de datos.
+![Pipelines web y orders-jdbc](img/lab05.png){width="6.3in"}\
 
-## Prerrequisitos
+### Duración aproximada
 
-### Conocimientos Previos
+-   105 minutos.
 
-- Familiaridad con la interfaz de Kibana (Discover, Stack Management) adquirida en prácticas anteriores.
-- Comprensión de campos ECS normalizados: `log.level`, `error.type`, `@timestamp`, `geoip.location`.
-- Experiencia básica con KQL (sintaxis de filtros) y conceptos de ES|QL (tuberías, comandos `FROM`, `WHERE`, `STATS`).
+### Prerrequisitos
 
-### Acceso y Datos Requeridos
+-   Prácticas 2 a 4 completadas: Logstash y Filebeat instalados,
+    component template `mercanova-settings` e índice `orders` con 1 800
+    pedidos.
+-   MariaDB en la VM y el driver `mariadb-java-client.jar` en
+    `$LABS/downloads`.
+-   Archivos `data/nginx/mercanova-access-2026.10.19.log`,
+    `data/mysql/mercanova.sql` y `data/mysql/new_orders.sql`.
 
-| Recurso | Estado Requerido |
-|---------|-----------------|
-| Índice `labs-logstash-app-*` (Práctica 4) | ≥ 200 documentos indexados |
-| Data view `labs-logstash-app-*` | Creado y funcional |
-| Data view `labs-elastic-agent` (Práctica 3) | Con datos disponibles |
-| Data view `labs-nginx-sample` (Práctica 1) | Con datos de referencia |
-| Stack Elastic (es01, kibana01, logstash01) | Contenedores en ejecución |
+### Instrucciones
 
-## Entorno de Laboratorio
+**Escenario:** MercaNova quiere ver su tráfico web en Kibana: códigos de
+respuesta, rutas, tiempos, países y navegadores. Hoy el log de Nginx es
+una línea de texto sin estructura. También quiere que los pedidos de su
+base de datos MariaDB lleguen solos a Elasticsearch, incluidos los nuevos
+y los que cambian de estado. Construirás dos pipelines de Logstash:
+`web` y `orders-jdbc`.
 
-### Software Utilizado
+Una línea del log de Nginx de MercaNova tiene este formato (*combined*
+más el tiempo de respuesta en segundos):
 
-| Componente | Versión | Puerto |
-|------------|---------|--------|
-| Elasticsearch | 8.14.1 | 9200 |
-| Kibana | 8.14.1 | 5601 |
-| Logstash | 8.14.1 | 5044 / 8080 |
-| Python | 3.12.3 | — |
-
-### Verificación Inicial del Entorno
-
-```bash
-# Verificar que los contenedores están en ejecución
-cd ~/elastic-labs/
-docker compose ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
-
-# Verificar conectividad con Elasticsearch
-curl -sk -u elastic:ElasticLabs2024! https://localhost:9200/_cluster/health?pretty | jq '{status, number_of_nodes}'
-
-# Verificar que existen datos en los índices necesarios
-curl -sk -u elastic:ElasticLabs2024! https://localhost:9200/labs-logstash-app-*/_count | jq '.count'
-curl -sk -u elastic:ElasticLabs2024! https://localhost:9200/labs-nginx-sample/_count | jq '.count'
+``` 
+201.141.37.112 - - [19/Oct/2026:14:32:10 -0600] "POST /api/checkout
+HTTP/1.1" 504 167 "-" "Mozilla/5.0 (iPhone; ...)" 30.008
 ```
 
-**Salida esperada:**
+``` 
+$ source /home/student/labs/scripts/env.sh && cd $LABS
+```
 
-```json
+------------------------------------------------------------------------
+
+### Tarea 1. Preparar credenciales y destino
+
+#### Paso 1. Crea una API key para Logstash
+
+``` 
+POST _security/api_key
 {
-  "status": "green",
-  "number_of_nodes": 1
+  "name": "logstash-mercanova",
+  "expiration": "180d",
+  "role_descriptors": {
+    "logstash_writer": {
+      "cluster": [ "monitor" ],
+      "indices": [ {
+        "names": [ "logs-mercanova.*", "logs-loadtest-*",
+                   "orders" ],
+        "privileges": [ "create_doc", "create_index", "index",
+                        "auto_configure", "view_index_metadata" ]
+      } ]
+    }
+  }
 }
 ```
 
-El conteo de `labs-logstash-app-*` debe ser ≥ 200.
+**Qué hace y por qué:** una **API key** es una credencial para procesos:
+tiene privilegios propios, que no pueden exceder los del usuario que la
+crea, expira (`180d`) y se revoca sin tocar ningún usuario. La respuesta
+trae `id` y `api_key`; Logstash los usa juntos con el formato
+`id:api_key`. **Copia ambos valores ahora**: el secreto no se vuelve a
+mostrar.
 
----
+#### Paso 2. Guarda la API key en el keystore de Logstash
 
-## Paso 1: Explorar Datos con KQL en Discover
-
-### Objetivo
-
-Utilizar Kibana Discover con consultas KQL para identificar patrones de error en los logs indexados, familiarizándose con la distribución de campos antes de construir el dashboard.
-
-### Instrucciones
-
-1. Abre Kibana en el navegador: `https://localhost:5601`. Inicia sesión con `elastic` / `ElasticLabs2024!`.
-
-2. Navega a **Discover** (menú lateral izquierdo → Analytics → Discover).
-
-3. En el selector de data view (esquina superior izquierda), selecciona **`labs-logstash-app-*`**.
-
-4. Ajusta el rango temporal a **Last 24 hours** usando el selector de tiempo en la esquina superior derecha.
-
-5. En la barra de búsqueda KQL, escribe la siguiente consulta y presiona Enter:
-
-```
-log.level: "ERROR"
+``` 
+$ cd /opt/elastic/logstash
+$ sudo -u elastic bin/logstash-keystore --path.settings config \
+      add LS_API_KEY
+Enter value for LS_API_KEY: VuaCfGcBCdbkQm-e5aOx:ui2lp2axTNmsyakw9tvNnw
+$ sudo -u elastic bin/logstash-keystore --path.settings config \
+      add MYSQL_PWD
+Enter value for MYSQL_PWD: Logstash#2026
+$ sudo -u elastic bin/logstash-keystore --path.settings config list
 ```
 
-6. Observa el número de documentos coincidentes (hits) en la parte superior de la tabla de resultados.
-
-7. En el panel lateral izquierdo, localiza el campo `error.type` y haz clic sobre él para ver los top valores. Identifica las clases Java más frecuentes.
-
-8. Amplía la consulta para buscar errores de una clase específica:
-
-```
-log.level: "ERROR" AND error.type: "NullPointerException"
-```
-
-9. Agrega las columnas `@timestamp`, `log.level`, `error.type` y `message` a la tabla haciendo clic en el ícono `+` junto a cada campo en el panel lateral.
-
-10. Guarda esta búsqueda: haz clic en **Save** (parte superior), nómbrala `Labs - Errores NPE` y confirma.
-
-11. Ahora cambia el data view a **`labs-nginx-sample`** y ejecuta:
-
-```
-http.response.status_code >= 500
-```
-
-12. Observa la distribución de errores 5xx por `url.path` en el panel lateral de campos.
-
-### Salida Esperada
-
-- La consulta `log.level: "ERROR"` debe retornar documentos con el campo `log.level` conteniendo exactamente "ERROR".
-- El campo `error.type` debe mostrar valores como `NullPointerException`, `IOException`, `TimeoutException` u otros similares generados por el script de prácticas anteriores.
-- El data view `labs-nginx-sample` debe mostrar eventos con códigos 500, 502 o 503.
-
-### Verificación
-
-- [ ] Se visualizan documentos filtrados por `log.level: "ERROR"` en `labs-logstash-app-*`.
-- [ ] El panel lateral muestra la distribución de `error.type` con al menos 2 tipos distintos.
-- [ ] La búsqueda guardada `Labs - Errores NPE` aparece en la lista de búsquedas guardadas.
-
----
-
-## Paso 2: Ejecutar Consultas Analíticas con ES|QL
-
-### Objetivo
-
-Utilizar ES|QL en Discover para realizar consultas agregadas que cuantifiquen errores por clase Java y por hora, generando insights tabulares que informen el diseño del dashboard.
-
-### Instrucciones
-
-1. En Discover, cambia al modo **ES|QL** haciendo clic en el botón de alternancia junto a la barra de búsqueda (o seleccionando "ES|QL" en el menú desplegable del lenguaje de consulta).
-
-2. Ejecuta la siguiente consulta para contar errores por tipo en las últimas 24 horas:
-
-```esql
-FROM labs-logstash-app-*
-| WHERE @timestamp >= NOW() - 24 hours AND log.level == "ERROR"
-| STATS error_count = COUNT(*) BY error.type
-| SORT error_count DESC
-| LIMIT 10
-```
-
-3. Observa la tabla resultante. Anota los top 3 tipos de error y sus conteos.
-
-4. Ejecuta una segunda consulta para analizar la distribución temporal de errores por hora:
-
-```esql
-FROM labs-logstash-app-*
-| WHERE @timestamp >= NOW() - 24 hours AND log.level == "ERROR"
-| EVAL hour = DATE_TRUNC(1 hour, @timestamp)
-| STATS hourly_errors = COUNT(*) BY hour
-| SORT hour ASC
-```
-
-5. Ejecuta una tercera consulta comparativa entre fuentes de datos:
-
-```esql
-FROM labs-logstash-app-*
-| WHERE @timestamp >= NOW() - 24 hours
-| STATS
-    total = COUNT(*),
-    errors = COUNT(*) WHERE log.level == "ERROR",
-    warnings = COUNT(*) WHERE log.level == "WARN"
-| EVAL error_pct = ROUND(errors * 100.0 / total, 2)
-```
-
-6. Regresa al modo KQL haciendo clic en el selector de lenguaje.
-
-### Salida Esperada
-
-La primera consulta debe producir una tabla similar a:
-
-```
-error.type              | error_count
-------------------------|------------
-NullPointerException    | 45
-IOException             | 32
-TimeoutException        | 28
-...
-```
-
-La segunda consulta mostrará el conteo de errores agrupado por hora.
-
-### Verificación
-
-- [ ] Las consultas ES|QL se ejecutan sin errores de sintaxis.
-- [ ] La tabla de resultados muestra datos agregados con columnas calculadas.
-- [ ] Se identifican al menos 2 tipos de error distintos con sus conteos.
-
----
-
-## Paso 3: Crear el Dashboard con Cinco Visualizaciones Lens
-
-### Objetivo
-
-Construir el dashboard `Labs - Application Error Monitor` con cinco visualizaciones Lens que cubran métricas, tendencias temporales, top errores, distribución geográfica y comparación entre fuentes.
-
-### Instrucciones
-
-#### 3.1 Crear el Dashboard
-
-1. Navega a **Dashboard** (menú lateral → Analytics → Dashboard).
-
-2. Haz clic en **Create dashboard**.
-
-3. Antes de agregar visualizaciones, haz clic en el ícono de configuración (engranaje) o en **Save** y nombra el dashboard: `Labs - Application Error Monitor`. Marca "Store time with dashboard" y selecciona **Last 24 hours**. Guarda.
-
-#### 3.2 Visualización 1: Métrica de Conteo Total de Errores (últimas 24h)
-
-4. Haz clic en **Create visualization** (o el botón `+` → Lens).
-
-5. En el editor Lens:
-   - **Data view**: `labs-logstash-app-*`
-   - **Tipo de visualización**: Selecciona **Metric** en el selector de tipo (parte superior del editor).
-   - **Filtro de panel**: En la barra de filtro del panel, escribe: `log.level: "ERROR"`
-   - **Métrica primaria**: Arrastra el campo `Records` al área de métrica (o configura `Count` como función).
-   - **Título**: Haz clic en el título y escribe `Total Errores (24h)`.
-
-6. Haz clic en **Save and return** para añadir la visualización al dashboard.
-
-#### 3.3 Visualización 2: Barras Apiladas de Eventos por log.level en el Tiempo
-
-7. Haz clic en **Create visualization** nuevamente.
-
-8. En el editor Lens:
-   - **Data view**: `labs-logstash-app-*`
-   - **Tipo de visualización**: **Bar vertical stacked**.
-   - **Eje horizontal**: `@timestamp` con intervalo automático (Date histogram).
-   - **Eje vertical**: `Count` de registros.
-   - **Break down by**: Campo `log.level` (arrastrar al área "Break down by" o configurar como Top values de `log.level`, top 5).
-   - **Título**: `Eventos por Nivel de Log`
-
-9. Haz clic en **Save and return**.
-
-#### 3.4 Visualización 3: Tabla de Top 10 Errores por error.type
-
-10. Crea una nueva visualización Lens.
-
-11. Configuración:
-    - **Data view**: `labs-logstash-app-*`
-    - **Tipo de visualización**: **Table**.
-    - **Filtro de panel**: `log.level: "ERROR"`
-    - **Columna 1 (Rows)**: Top values de `error.type`, tamaño 10.
-    - **Columna 2 (Metrics)**: Count de registros. Etiqueta: `Conteo`.
-    - **Título**: `Top 10 Tipos de Error`
-
-12. Ordena por la columna de conteo en orden descendente. **Save and return**.
-
-#### 3.5 Visualización 4: Mapa de Distribución Geográfica
-
-13. Crea una nueva visualización Lens.
-
-14. Configuración:
-    - **Data view**: `labs-logstash-app-*`
-    - **Tipo de visualización**: Selecciona **Map** (Choropleth/Region map). Si el tipo Map no está disponible directamente en Lens, usa **Maps** como visualización embebida:
-      - Alternativa: Haz clic en **Create visualization** → selecciona tipo **Maps** en lugar de Lens.
-      - Agrega una capa **Clusters and grids** con fuente `labs-logstash-app-*`.
-      - Campo de geolocalización: `geoip.location` (tipo `geo_point`).
-      - Métrica: Count.
-    - **Título**: `Distribución Geográfica de Eventos`
-
-15. **Save and return**.
-
-> **Nota**: Si el campo `geoip.location` no contiene datos suficientes, puedes usar el data view `labs-nginx-sample` como fuente alternativa para esta visualización, ya que los logs de Nginx suelen incluir IPs de clientes enriquecidas con GeoIP.
-
-#### 3.6 Visualización 5: Líneas Comparando Volumen Logstash vs Elastic Agent
-
-16. Crea una nueva visualización Lens.
-
-17. Configuración:
-    - **Tipo de visualización**: **Line**.
-    - Necesitas combinar dos fuentes. Método recomendado:
-      - **Capa 1**: Data view `labs-logstash-app-*`, función Count sobre `@timestamp` (Date histogram). Etiqueta la serie como `Logstash`.
-      - **Capa 2**: Haz clic en el botón **+** (Add layer) → selecciona "New visualization layer" con data view `labs-elastic-agent`, función Count sobre `@timestamp`. Etiqueta como `Elastic Agent`.
-    - **Título**: `Volumen de Logs: Logstash vs Elastic Agent`
-
-18. **Save and return**.
-
-#### 3.7 Organizar y Guardar el Dashboard
-
-19. Reorganiza las visualizaciones en el dashboard arrastrándolas:
-    - Fila superior: Métrica (ancho pequeño) + Barras apiladas (ancho amplio).
-    - Fila media: Tabla de top errores (mitad) + Mapa geográfico (mitad).
-    - Fila inferior: Gráfico de líneas comparativo (ancho completo).
-
-20. Haz clic en **Save** para guardar el dashboard final.
-
-### Salida Esperada
-
-El dashboard `Labs - Application Error Monitor` debe mostrar:
-- Un número grande con el total de errores en las últimas 24h.
-- Un gráfico de barras con colores diferenciados por nivel (ERROR en rojo, WARN en amarillo, INFO en azul/verde).
-- Una tabla con las clases de excepción más frecuentes.
-- Un mapa con puntos o regiones coloreadas según volumen de eventos.
-- Dos líneas temporales comparando el volumen de las dos fuentes.
-
-### Verificación
-
-- [ ] El dashboard contiene exactamente 5 visualizaciones.
-- [ ] Cada visualización muestra datos reales (no "No results found").
-- [ ] El título del dashboard es `Labs - Application Error Monitor`.
-- [ ] El rango temporal por defecto es "Last 24 hours".
-
----
-
-## Paso 4: Crear el Conector Server Log
-
-### Objetivo
-
-Configurar un conector de tipo "Server log" en Kibana que servirá como destino de notificación para la regla de alerta.
-
-### Instrucciones
-
-1. Navega a **Stack Management** → **Rules and Connectors** → pestaña **Connectors**.
-
-2. Haz clic en **Create connector**.
-
-3. Selecciona el tipo **Server log**.
-
-4. Configura:
-   - **Connector name**: `Labs - Server Log Connector`
-
-5. Haz clic en **Save**. No requiere configuración adicional ya que escribe directamente en los logs de Kibana.
-
-### Salida Esperada
-
-El conector aparece en la lista de conectores con estado "Available" (ícono verde).
-
-### Verificación
-
-- [ ] El conector `Labs - Server Log Connector` aparece en la lista de conectores activos.
-
----
-
-## Paso 5: Configurar la Regla de Alerta de Picos de Errores
-
-### Objetivo
-
-Crear una regla de alerta llamada `labs-error-spike-alert` de tipo "Elasticsearch query" que se dispare cuando el conteo de documentos con `log.level: ERROR` supere 10 en una ventana de 5 minutos.
-
-### Instrucciones
-
-1. Navega a **Stack Management** → **Rules** (o **Alerting** → **Rules** en el menú lateral bajo Management).
-
-2. Haz clic en **Create rule**.
-
-3. Configura los campos generales:
-   - **Name**: `labs-error-spike-alert`
-   - **Tags**: `labs`, `errors`
-   - **Check every**: `1 minute`
-
-4. En **Rule type**, selecciona **Elasticsearch query** (bajo la categoría "Stack Rules" o "Observability" dependiendo de la versión).
-
-5. Configura la condición de la regla:
-   - **Index**: Escribe `labs-logstash-app-*` (o selecciona el data view correspondiente si la UI lo permite).
-   - **Time field**: `@timestamp`
-   - **Define your query using**: **KQL**
-   - **Query**: 
-     ```
-     log.level: "ERROR"
-     ```
-   - **Condition**: `IS ABOVE` → **Threshold**: `10`
-   - **Time window**: `5 minutes`
-   - **Size** (documentos a retornar en la alerta): `100`
-
-6. En la sección **Actions**, haz clic en **Add action** → selecciona el conector `Labs - Server Log Connector`.
-
-7. Configura el mensaje de la acción:
-   - **Message**:
-     ```
-     [ALERTA] Se detectaron {{context.hits}} errores en los últimos 5 minutos. Umbral: 10. Timestamp: {{context.date}}. Documentos: {{context.conditions.resultsLink}}
-     ```
-   
-   > **Nota**: Las variables de contexto disponibles pueden variar. Si `{{context.hits}}` no es reconocida, usa `{{context.value}}` o `{{context.title}}`. Consulta la documentación del template de la regla.
-
-8. Haz clic en **Save**.
-
-9. Verifica que la regla aparece en la lista con estado **Active** (verde).
-
-### Salida Esperada
-
-La regla `labs-error-spike-alert` aparece en Stack Management → Rules con:
-- Estado: Active
-- Última ejecución: muestra el timestamp de la última verificación
-- Check interval: 1 minute
-
-### Verificación
-
-- [ ] La regla está creada con el nombre `labs-error-spike-alert`.
-- [ ] El tipo de regla es "Elasticsearch query".
-- [ ] El umbral está configurado en >10 documentos en 5 minutos.
-- [ ] La acción apunta al conector `Labs - Server Log Connector`.
-
----
-
-## Paso 6: Validar la Regla de Alerta con un Pico Artificial de Errores
-
-### Objetivo
-
-Generar un pico controlado de errores mediante un script Python para confirmar que la regla de alerta se activa correctamente.
-
-### Instrucciones
-
-1. Crea el script generador de picos de errores:
-
-```bash
-cat > ~/elastic-labs/scripts/error_spike_generator.py << 'EOF'
-#!/usr/bin/env python3
-"""
-Genera un pico de errores para validar la regla de alerta labs-error-spike-alert.
-Envía 20 documentos con log.level: ERROR al input HTTP de Logstash.
-"""
-
-import json
-import time
-import random
-import requests
-from datetime import datetime, timezone
-
-LOGSTASH_HTTP_URL = "http://localhost:8080"
-NUM_ERRORS = 20
-
-error_types = [
-    "NullPointerException",
-    "IOException",
-    "TimeoutException",
-    "OutOfMemoryError",
-    "IllegalStateException"
-]
-
-messages = [
-    "Failed to process request: connection refused",
-    "Null reference in OrderService.processPayment()",
-    "Timeout waiting for database response after 30000ms",
-    "Heap space exhausted during batch processing",
-    "Invalid state transition from PENDING to COMPLETED"
-]
-
-def generate_error_event():
-    error_type = random.choice(error_types)
-    return {
-        "@timestamp": datetime.now(timezone.utc).isoformat(),
-        "log": {"level": "ERROR"},
-        "message": random.choice(messages),
-        "error": {"type": error_type},
-        "service": {"name": "labs-spike-test"},
-        "host": {"name": "spike-generator-01"},
-        "geoip": {
-            "location": {
-                "lat": round(random.uniform(19.0, 51.0), 4),
-                "lon": round(random.uniform(-122.0, -73.0), 4)
-            }
-        }
+**Qué hace y por qué:** los pipelines usarán `${LS_API_KEY}` y
+`${MYSQL_PWD}` sin escribir secretos en los `.conf`. `list` muestra los
+nombres guardados, nunca los valores.
+
+#### Paso 3. Crea la plantilla del data stream web
+
+``` 
+PUT _component_template/mercanova-web-mappings
+{
+  "template": {
+    "mappings": {
+      "properties": {
+        "source": { "properties": {
+          "address": { "type": "keyword" },
+          "ip":      { "type": "ip" },
+          "geo": { "properties": {
+            "location":         { "type": "geo_point" },
+            "city_name":        { "type": "keyword" },
+            "country_iso_code": { "type": "keyword" } } } } },
+        "http": { "properties": {
+          "request":  { "properties": {
+            "method": { "type": "keyword" } } },
+          "response": { "properties": {
+            "status_code": { "type": "short" },
+            "body": { "properties": {
+              "bytes": { "type": "long" } } } } } } },
+        "url": { "properties": {
+          "original": { "type": "keyword" },
+          "path":     { "type": "keyword" },
+          "query":    { "type": "keyword" } } },
+        "event": { "properties": {
+          "duration_ms": { "type": "long" },
+          "duration_s":  { "type": "float" } } },
+        "trace": { "properties": { "id": { "type": "keyword" } } }
+      }
     }
+  }
+}
 
-def main():
-    print(f"[*] Generando {NUM_ERRORS} eventos de error para validar alerta...")
-    success_count = 0
-    
-    for i in range(NUM_ERRORS):
-        event = generate_error_event()
-        try:
-            response = requests.post(
-                LOGSTASH_HTTP_URL,
-                json=event,
-                headers={"Content-Type": "application/json"},
-                timeout=5
-            )
-            if response.status_code == 200:
-                success_count += 1
-            else:
-                print(f"  [!] Evento {i+1}: HTTP {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            print(f"  [!] Evento {i+1}: Error de conexión - {e}")
-        
-        time.sleep(0.2)  # Pequeña pausa entre eventos
-    
-    print(f"[+] Enviados {success_count}/{NUM_ERRORS} eventos exitosamente.")
-    print(f"[*] Esperando ~60-120 segundos para que la regla se evalúe...")
-    print(f"[*] Verifica en Kibana: Stack Management > Rules > labs-error-spike-alert")
+PUT _index_template/mercanova-web
+{
+  "index_patterns": [ "logs-mercanova.web-*" ],
+  "data_stream": {},
+  "composed_of": [ "ecs@mappings", "mercanova-settings",
+                   "mercanova-web-mappings" ],
+  "priority": 500
+}
+```
 
-if __name__ == "__main__":
-    main()
+**Qué hace y por qué:** el campo `source.geo.location` debe ser
+**`geo_point`** para dibujarlo en un mapa (práctica 7); si el mapping
+dinámico lo creara como objeto con `lat` y `lon` numéricos, el mapa no
+funcionaría. `ecs@mappings` es una component template integrada de 8.x
+con reglas para los demás campos ECS (por ejemplo, `*.ip` como `ip`).
+`mercanova-settings` aporta shards y réplicas, y en la práctica 10 la
+retención.
+
+### Tarea 2. Desarrollar el patrón grok
+
+#### Paso 4. Prueba el patrón en Grok Debugger
+
+Abre **Dev Tools \> Grok Debugger** y pega:
+
+-   **Sample data:** una línea de
+    `head -3 data/nginx/mercanova-access-2026.10.19.log | tail -1`.
+-   **Grok pattern:**
+
+``` 
+^%{HTTPD_COMBINEDLOG} %{NUMBER:[event][duration_s]:float}
+```
+
+**Qué hace y por qué:** `HTTPD_COMBINEDLOG` es un patrón integrado que
+reconoce el formato *combined* de Apache y Nginx y, en modo ECS, produce
+`source.address`, `http.request.method`, `url.original`,
+`http.version`, `http.response.status_code`,
+`http.response.body.bytes`, `http.request.referrer` y
+`user_agent.original`. La sintaxis `%{PATRÓN:campo:tipo}` captura el
+tiempo de respuesta y lo convierte a `float`. El ancla `^` hace que el
+patrón falle rápido en líneas que no empiezan como se espera.
+
+#### Paso 5. Prueba el pipeline en consola con `rubydebug`
+
+``` 
+$ head -5 data/nginx/mercanova-access-2026.10.19.log | \
+  sudo -u elastic bin/logstash --path.data /tmp/ls-test -e '
+  input { stdin {} }
+  filter {
+    grok { match => { "message" =>
+      "^%{HTTPD_COMBINEDLOG} %{NUMBER:[event][duration_s]:float}" } }
+  }
+  output { stdout { codec => rubydebug } }'
+```
+
+(Ejecútalo desde `/opt/elastic/logstash`).
+
+**Qué hace y por qué:** `-e` recibe la configuración en línea y
+`--path.data /tmp/ls-test` usa un directorio de datos distinto al del
+servicio, porque dos instancias de Logstash no pueden compartirlo.
+`rubydebug` imprime cada evento con todos sus campos: es la forma más
+rápida de ver qué produce un filtro. Verás que la primera línea, un
+health check desde `127.0.0.1`, también se estructura, pero no aporta
+nada al análisis.
+
+### Tarea 3. Pipeline web
+
+#### Paso 6. Revisa el pipeline `web.conf`
+
+``` 
+$ less pipelines/web.conf
+```
+
+El pipeline aplica, en orden, estos filtros:
+
+| Filtro (id) | Qué hace | Por qué así |
+|--------------|-----------------------|-----------------------|
+| `drop-health` | Descarta `GET /health`. | Cada 30 s hay un health check: 2 880 eventos diarios sin valor. Se descartan **primero** para no gastar CPU en ellos. |
+| `grok-nginx` | Estructura la línea. | Patrón del Paso 4, con un grupo opcional `trace=...` que usarás en la práctica 11. |
+| `grok-url` | Separa `url.path` y `url.query`. | Agrupar por ruta sin que cada `?q=` cree un valor distinto. |
+| `date-nginx` | Asigna `@timestamp`. | La hora real del evento, no la de llegada. El formato incluye `Z` (`-0600`), así que no hace falta `timezone`. |
+| `geoip` | Agrega `source.geo.*`. | País, ciudad y coordenadas con la base GeoLite2 incluida en Logstash. |
+| `useragent` | Agrega `user_agent.*`. | Navegador, sistema operativo y dispositivo. |
+| `duration-ms` | Calcula `duration_ms`. | Milisegundos enteros, más cómodos en dashboards. |
+| `tag-5xx` | Etiqueta `server_error`. | Filtrar errores de servidor con un clic. |
+| `set-service` | Limpia campos. | Quita `event.original` y metadatos de Filebeat que duplican información. |
+
+Y la salida:
+
+``` 
+elasticsearch {
+  hosts => [ "https://localhost:9200" ]
+  ssl_certificate_authorities => "/opt/elastic/certs/http_ca.crt"
+  api_key => "${LS_API_KEY}"
+  data_stream => true
+  data_stream_type => "logs"
+  data_stream_dataset => "mercanova.web"
+  data_stream_namespace => "default"
+}
+```
+
+**Qué hace y por qué:** con `data_stream => true`, Logstash escribe en
+`<type>-<dataset>-<namespace>` = `logs-mercanova.web-default` usando la
+acción `create`. Cada plugin tiene un `id` explícito: en la práctica 9
+lo usarás para encontrar el filtro más lento en la API de monitoreo.
+
+#### Paso 7. Activa los dos pipelines del curso
+
+``` 
+$ sudo tee config/pipelines.yml > /dev/null <<'EOF'
+- pipeline.id: web
+  path.config: "/opt/elastic/logstash/pipelines/web.conf"
+  pipeline.workers: 2
+
+- pipeline.id: orders-jdbc
+  path.config: "/opt/elastic/logstash/pipelines/orders.conf"
+  pipeline.workers: 1
 EOF
-
-chmod +x ~/elastic-labs/scripts/error_spike_generator.py
 ```
 
-2. Verifica que el input HTTP de Logstash está activo:
+**Qué hace y por qué:** cada pipeline es independiente: tiene sus
+workers, su cola y su configuración. Si MariaDB no responde, el pipeline
+`orders-jdbc` falla, pero `web` sigue procesando logs. `orders-jdbc` usa
+un worker porque el volumen es bajo y así los pedidos se procesan en
+orden. El pipeline `lab02-test` deja de ejecutarse.
 
-```bash
-curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080 \
-  -H "Content-Type: application/json" \
-  -d '{"test": "connectivity"}'
+#### Paso 8. Instala el driver JDBC y valida la configuración
+
+``` 
+$ sudo -u elastic mkdir -p drivers
+$ sudo cp $LABS/downloads/mariadb-java-client.jar drivers/
+$ sudo chown elastic:elastic drivers/*.jar
+$ sudo -u elastic bin/logstash --path.settings config \
+      --path.data /tmp/ls-test --config.test_and_exit
+Configuration OK
 ```
 
-**Salida esperada**: `200`
+**Qué hace y por qué:** sin `-f`, Logstash valida todos los pipelines de
+`pipelines.yml`. El input JDBC no incluye drivers: cada base de datos
+tiene el suyo y se indica con `jdbc_driver_library`. Se usa el driver
+de MariaDB porque Debian incluye MariaDB, compatible con MySQL.
 
-3. Instala la dependencia `requests` si no está disponible:
+#### Paso 9. Carga la base de datos de MercaNova
 
-```bash
-pip3 install requests 2>/dev/null || pip install requests
+``` 
+$ sudo mysql < $LABS/data/mysql/mercanova.sql
+$ sudo mysql -e "SELECT COUNT(*) AS pedidos,
+      MAX(updated_at) AS ultimo FROM mercanova.orders"
++---------+-------------------------+
+| pedidos | ultimo                  |
++---------+-------------------------+
+|    1800 | 2026-10-19 23:54:01.000 |
++---------+-------------------------+
 ```
 
-4. Ejecuta el script:
+**Qué hace y por qué:** el script crea la base `mercanova` con las tablas
+`customers` (600 clientes) y `orders` (1 800 pedidos), y el usuario
+`logstash` con permiso **solo de lectura** (`SELECT`): Logstash no
+necesita modificar la base de datos.
 
-```bash
-cd ~/elastic-labs/scripts/
-python3 error_spike_generator.py
+#### Paso 10. Reinicia Logstash y prepara Filebeat
+
+``` 
+$ sudo systemctl restart logstash
+$ curl -s localhost:9600/_node/pipelines | jq '.pipelines | keys'
+[ "orders-jdbc", "web" ]
+$ sudo cp $LABS/config/filebeat/filebeat-lab05.yml \
+      /opt/elastic/filebeat/filebeat.yml
+$ sudo /opt/elastic/filebeat/filebeat test config \
+      -c /opt/elastic/filebeat/filebeat.yml
 ```
 
-5. Espera 60-120 segundos para que la regla se evalúe (intervalo de 1 minuto).
+**Qué hace y por qué:** la configuración nueva de Filebeat lee
+`/var/log/mercanova/nginx-access.log` con un input `filestream`
+(`id: mercanova-web`) y agrega `service.name: nginx`. Revisa en el
+archivo los parámetros `bulk_max_size: 2048`, eventos por lote enviado a
+Logstash, y `prospector.scanner.check_interval: 5s`, cada cuánto busca
+archivos nuevos.
 
-6. Verifica que los documentos llegaron al índice:
+#### Paso 11. Reproduce el log del día y arranca Filebeat
 
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_search?pretty" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": {
-      "bool": {
-        "must": [
-          {"term": {"log.level": "ERROR"}},
-          {"term": {"service.name": "labs-spike-test"}}
-        ],
-        "filter": [
-          {"range": {"@timestamp": {"gte": "now-10m"}}}
-        ]
-      }
-    },
-    "size": 3
-  }' | jq '.hits.total.value'
+``` 
+$ scripts/replay-nginx.sh
+Líneas en /var/log/mercanova/nginx-access.log: 29520
+$ sudo systemctl start filebeat
+$ watch -n 5 'curl -s localhost:9600/_node/stats/pipelines/web | \
+  jq ".pipelines.web.events | {in, filtered, out}"'
 ```
 
-**Salida esperada**: `20` (o un número cercano).
+**Qué hace y por qué:** `replay-nginx.sh` copia el log del 19 de
+octubre al archivo que vigila Filebeat (con un segundo argumento
+reproduce a cierto ritmo, por ejemplo `... log 50` para 50 líneas por
+segundo). La API de Logstash muestra cómo avanzan los eventos: `in`
+llegará a 29 520 y `out` a 26 640, porque los 2 880 health checks se
+descartan. Presiona `Ctrl + C` cuando `in` deje de crecer.
 
-7. Verifica el estado de la alerta en Kibana:
-   - Navega a **Stack Management** → **Rules**.
-   - Localiza `labs-error-spike-alert`.
-   - Verifica que la columna **Last response** muestra `Active` (alerta disparada) en color naranja/rojo.
-   - Haz clic en la regla para ver el historial de ejecuciones.
+#### Paso 12. Verifica la calidad de los datos
 
-8. Confirma la notificación en los logs de Kibana:
+``` 
+GET logs-mercanova.web-default/_count
 
-```bash
-docker logs kibana01 2>&1 | grep -i "ALERTA\|alert\|labs-error-spike" | tail -5
-```
+GET logs-mercanova.web-default/_count
+{ "query": { "term": { "tags": "_grokparsefailure" } } }
 
-### Salida Esperada
-
-```
-[*] Generando 20 eventos de error para validar alerta...
-[+] Enviados 20/20 eventos exitosamente.
-[*] Esperando ~60-120 segundos para que la regla se evalúe...
-[*] Verifica en Kibana: Stack Management > Rules > labs-error-spike-alert
-```
-
-En Kibana, la regla debe mostrar estado "Active" con el último disparo reciente.
-
-### Verificación
-
-- [ ] El script envió exitosamente 20 eventos de error.
-- [ ] Los documentos aparecen en el índice `labs-logstash-app-*` con `service.name: "labs-spike-test"`.
-- [ ] La regla `labs-error-spike-alert` cambió a estado "Active" (alerta disparada).
-- [ ] Los logs de Kibana contienen la notificación del Server log connector.
-
----
-
-## Validación Final y Testing
-
-### Lista de Verificación Completa
-
-Ejecuta las siguientes comprobaciones para confirmar que toda la práctica se completó correctamente:
-
-```bash
-# 1. Verificar que el dashboard existe
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:5601/api/saved_objects/_find?type=dashboard&search_fields=title&search=Labs%20-%20Application%20Error%20Monitor" \
-  -H "kbn-xsrf: true" | jq '.total'
-```
-
-**Esperado**: `1`
-
-```bash
-# 2. Verificar que la regla existe y está activa
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:5601/api/alerting/rules/_find?search=labs-error-spike-alert" \
-  -H "kbn-xsrf: true" | jq '.data[0] | {name, enabled, executionStatus: .execution_status.status}'
-```
-
-**Esperado**:
-```json
+GET logs-mercanova.web-default/_search
 {
-  "name": "labs-error-spike-alert",
-  "enabled": true,
-  "executionStatus": "active"
+  "size": 1,
+  "query": { "term": { "http.response.status_code": 504 } },
+  "_source": [ "@timestamp", "source.geo.city_name",
+    "source.geo.country_iso_code", "url.path",
+    "http.response.status_code", "event.duration_ms",
+    "user_agent.name", "user_agent.os.name", "tags" ]
+}
+
+GET logs-mercanova.web-default/_mapping/field/source.geo.location
+```
+
+**Qué hace y por qué:** el primer conteo debe ser **26 640** y el de
+fallas de grok **0**: así sabes que el patrón cubre todas las líneas. El
+documento de ejemplo muestra la estructura final: ciudad y país (pueden
+variar según la base GeoLite2), ruta, código 504, duración en
+milisegundos, navegador y la etiqueta `server_error`. El último comando
+confirma que `source.geo.location` es `geo_point`.
+
+#### Paso 13. Responde dos preguntas rápidas
+
+``` 
+GET logs-mercanova.web-default/_search
+{
+  "size": 0,
+  "aggs": {
+    "codigos": { "terms": { "field": "http.response.status_code" } },
+    "errores_5xx": { "filter": { "term": { "tags": "server_error" } } }
+  }
 }
 ```
 
-```bash
-# 3. Verificar que el conector existe
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:5601/api/actions/connectors" \
-  -H "kbn-xsrf: true" | jq '.[] | select(.name == "Labs - Server Log Connector") | {name, connector_type_id, is_preconfigured}'
-```
+**Qué hace y por qué:** comprueba que los datos ya responden preguntas
+de operación. Resultado esperado: 640 respuestas **504**, 329 respuestas
+404 y 749 eventos con la etiqueta `server_error`.
 
-**Esperado**:
-```json
-{
-  "name": "Labs - Server Log Connector",
-  "connector_type_id": ".server-log",
-  "is_preconfigured": false
+### Tarea 4. Pipeline de pedidos con JDBC
+
+#### Paso 14. Revisa el input JDBC
+
+Fragmento de `pipelines/orders.conf`:
+
+``` 
+jdbc {
+  jdbc_driver_library =>
+    "/opt/elastic/logstash/drivers/mariadb-java-client.jar"
+  jdbc_driver_class => "org.mariadb.jdbc.Driver"
+  jdbc_connection_string =>
+    "jdbc:mariadb://localhost:3306/mercanova"
+  jdbc_user => "logstash"
+  jdbc_password => "${MYSQL_PWD}"
+  jdbc_default_timezone => "America/Mexico_City"
+  schedule => "*/5 * * * *"
+  statement => "SELECT o.id, ... FROM orders o
+    JOIN customers c ON c.id = o.customer_id
+    WHERE o.updated_at > :sql_last_value
+    ORDER BY o.updated_at"
+  use_column_value => true
+  tracking_column => "updated_at"
+  tracking_column_type => "timestamp"
+  last_run_metadata_path =>
+    "/opt/elastic/logstash/data/jdbc_orders_last_run"
+  jdbc_paging_enabled => true
+  jdbc_page_size => 1000
 }
 ```
 
-```bash
-# 4. Verificar búsqueda guardada
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:5601/api/saved_objects/_find?type=search&search_fields=title&search=Labs%20-%20Errores%20NPE" \
-  -H "kbn-xsrf: true" | jq '.total'
+**Qué hace y por qué:**
+
+| Opción | Por qué |
+|----------------------|--------------------------------------|
+| `jdbc_driver_library` / `jdbc_driver_class` | Driver de MariaDB Connector/J; la URL usa el esquema `jdbc:mariadb://`. |
+| `jdbc_default_timezone` | Las fechas de MariaDB están en hora local; así se convierten bien a UTC. |
+| `schedule` | Sintaxis cron: cada 5 minutos. |
+| `statement` con `JOIN` | **Desnormaliza**: cada pedido llega con los datos de su cliente, porque Elasticsearch no hace joins al consultar. |
+| `:sql_last_value` | Último `updated_at` procesado: cada ejecución lee solo lo nuevo o modificado. |
+| `tracking_column` | Columna que alimenta `:sql_last_value`. `updated_at` también detecta **cambios**, no solo inserciones. |
+| `last_run_metadata_path` | Archivo donde se recuerda el último valor entre reinicios. |
+| `jdbc_paging_enabled` | Lee en páginas de 1 000 filas para no cargar todo en memoria. |
+
+#### Paso 15. Revisa la transformación y la salida
+
+``` 
+filter {
+  mutate {
+    rename => { "id" => "order_id"
+                "customer_region" => "[customer][region]" ... }
+    copy => { "created_at" => "@timestamp" }
+    remove_field => [ "created_at", "@version" ]
+  }
+}
+output {
+  elasticsearch {
+    index => "orders"
+    document_id => "%{order_id}"
+    action => "index"
+    ...
+  }
+}
 ```
 
-**Esperado**: `1`
+**Qué hace y por qué:** `rename` convierte las columnas planas de SQL en
+la estructura anidada del índice (`customer.region`, `payment.method`).
+`document_id => "%{order_id}"` es la clave del diseño: el `_id` es el
+número de pedido, así que **escribir dos veces el mismo pedido lo
+actualiza en lugar de duplicarlo**. `action => "index"` crea o
+reemplaza; por eso la API key incluye el privilegio `index`.
 
-### Criterios de Aceptación
+#### Paso 16. Espera la primera ejecución y verifica
 
-| Criterio | Cumplido |
-|----------|----------|
-| Dashboard con 5 visualizaciones funcionales | ☐ |
-| Consultas KQL ejecutadas correctamente en Discover | ☐ |
-| Consultas ES|QL con resultados agregados | ☐ |
-| Regla de alerta configurada y validada | ☐ |
-| Conector Server log funcional | ☐ |
-| Pico de errores generado y detectado | ☐ |
-
----
-
-## Solución de Problemas
-
-### Problema 1: La regla de alerta no se dispara tras generar el pico
-
-**Síntomas**: La regla permanece en estado "OK" (verde) después de enviar los 20 eventos de error y esperar más de 2 minutos.
-
-**Causa**: El índice configurado en la regla no coincide con el índice real donde Logstash escribe los documentos. Esto ocurre si el patrón de índice en la regla es `labs-logstash-app-*` pero Logstash escribe con un formato de fecha diferente (por ejemplo, `labs-logstash-app-2025.07.10`), o si el campo `log.level` se indexó con mayúsculas/minúsculas diferentes.
-
-**Solución**:
-
-```bash
-# Verificar el nombre exacto del índice donde se escribieron los eventos
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-logstash-app-*?v&s=index" 
-
-# Verificar el mapping del campo log.level
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_mapping/field/log.level?pretty"
-
-# Si el campo es log.level.keyword, ajustar la consulta KQL en la regla a:
-# log.level.keyword: "ERROR"
-# O si el valor se almacena en minúsculas:
-# log.level: "error"
+``` 
+$ sudo journalctl -u logstash -f | grep -i jdbc
+... [orders-jdbc] ... (0.08s) SELECT ... WHERE o.updated_at >
+'1970-01-01 00:00:00' ...
 ```
 
-Edita la regla en Stack Management → Rules → `labs-error-spike-alert` → Edit, corrige el patrón de índice o la consulta KQL, y guarda. Vuelve a ejecutar el script.
-
----
-
-### Problema 2: La visualización de mapa muestra "No results found"
-
-**Síntomas**: La visualización 4 (mapa de distribución geográfica) no muestra datos, mientras las otras visualizaciones sí funcionan correctamente.
-
-**Causa**: El campo `geoip.location` no tiene el tipo de mapping `geo_point` en el índice, o los documentos existentes (de prácticas anteriores) no contienen datos GeoIP porque el filtro GeoIP de Logstash no estaba configurado o las IPs eran privadas (127.0.0.1, 192.168.x.x) que no se pueden geolocalizar.
-
-**Solución**:
-
-```bash
-# Verificar si el campo geoip.location existe y su tipo
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_mapping/field/geoip.location?pretty"
-
-# Si no existe como geo_point, actualizar el index template
-curl -sk -u elastic:ElasticLabs2024! \
-  -X PUT "https://localhost:9200/_index_template/labs-logstash-template" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "index_patterns": ["labs-logstash-app-*"],
-    "template": {
-      "mappings": {
-        "properties": {
-          "geoip": {
-            "properties": {
-              "location": {"type": "geo_point"}
-            }
-          }
-        }
-      }
-    }
-  }'
-
-# Reindexar o regenerar datos con el script (que ya incluye coordenadas válidas)
-python3 ~/elastic-labs/scripts/error_spike_generator.py
+``` 
+GET orders/_count
 ```
 
-Alternativamente, cambia la fuente de la visualización al data view `labs-nginx-sample` si este contiene datos GeoIP válidos, y actualiza el filtro del panel para mostrar solo errores.
+**Qué hace y por qué:** la primera ejecución usa `1970-01-01` como
+`:sql_last_value` y lee los 1 800 pedidos. Como ya existían desde la
+práctica 4 con los mismos `_id`, el conteo **sigue en 1 800**: se
+actualizaron, no se duplicaron. El archivo `jdbc_orders_last_run` ahora
+guarda la fecha del último pedido.
 
----
+#### Paso 17. Inserta pedidos nuevos y actualiza uno
 
-## Limpieza
-
-Si deseas revertir los cambios realizados en esta práctica (opcional, solo si necesitas reiniciar):
-
-```bash
-# Eliminar los documentos de prueba del spike generator
-curl -sk -u elastic:ElasticLabs2024! \
-  -X POST "https://localhost:9200/labs-logstash-app-*/_delete_by_query" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": {
-      "term": {"service.name": "labs-spike-test"}
-    }
-  }'
-
-# Desactivar la regla de alerta (sin eliminarla)
-RULE_ID=$(curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:5601/api/alerting/rules/_find?search=labs-error-spike-alert" \
-  -H "kbn-xsrf: true" | jq -r '.data[0].id')
-
-curl -sk -u elastic:ElasticLabs2024! \
-  -X POST "https://localhost:5601/api/alerting/rule/${RULE_ID}/_disable" \
-  -H "kbn-xsrf: true"
-
-echo "Regla desactivada. Dashboard y búsquedas guardadas permanecen intactos."
+``` 
+$ sudo mysql < $LABS/data/mysql/new_orders.sql
+$ sudo cat /opt/elastic/logstash/data/jdbc_orders_last_run
+--- 2026-10-20 05:54:01.000000000 Z
 ```
 
-> **Nota**: No se recomienda eliminar el dashboard ni las visualizaciones ya que representan el entregable principal de esta práctica.
+Espera hasta 5 minutos (la siguiente ejecución del `schedule`) y
+consulta:
 
----
+``` 
+GET orders/_count
 
-## Resumen
+GET orders/_doc/88011?_source=status,updated_at
+```
 
-En esta práctica integradora has completado el ciclo completo de observabilidad operativa sobre el Elastic Stack:
+**Qué hace y por qué:** el archivo guarda el último `updated_at` leído
+(el pedido de las 23:54:01 hora local, expresado en UTC). El script
+inserta 42 pedidos con fecha actual y
+cambia a `refunded` el pedido 88011. La siguiente ejecución solo lee las
+filas con `updated_at` posterior al último valor: el conteo sube a
+**1 842** y el pedido 88011 muestra `status: refunded` con un
+`updated_at` reciente.
 
-| Actividad | Herramienta | Resultado |
-|-----------|-------------|-----------|
-| Exploración de datos con filtros | Discover + KQL | Identificación de patrones de error |
-| Análisis agregado tabular | Discover + ES|QL | Conteos por tipo y distribución temporal |
-| Visualización operativa | Lens + Dashboard | 5 visualizaciones en dashboard integrado |
-| Monitoreo proactivo | Alerting + Connectors | Regla automática con notificación |
-| Validación end-to-end | Python + API | Confirmación de disparo de alerta |
+### Tarea 5. Verificación final
 
-### Conceptos Clave Reforzados
+#### Paso 18. Revisa las estadísticas de ambos pipelines
 
-- **KQL** es ideal para filtrado rápido e interactivo; **ES|QL** extiende las capacidades con agregaciones y transformaciones en una sola consulta.
-- **Lens** permite crear visualizaciones sin código, con soporte para múltiples capas y data views en un mismo gráfico.
-- Las **reglas de alerta** de tipo "Elasticsearch query" evalúan consultas periódicamente y disparan acciones cuando se superan umbrales definidos.
-- El flujo completo (ingestión → indexación → exploración → visualización → alerta) demuestra la integración de todos los componentes del Elastic Stack trabajando en conjunto.
+``` 
+$ curl -s localhost:9600/_node/stats/pipelines | jq '.pipelines |
+  to_entries[] | {pipeline: .key, in: .value.events.in,
+  out: .value.events.out}'
+```
 
-### Recursos Adicionales
+**Qué hace y por qué:** resume cuántos eventos procesó cada pipeline.
+En `web`, la diferencia entre `in` y `out` son los health checks
+descartados; en `orders-jdbc`, `in` y `out` son iguales: 1 800 + 43
+filas leídas (los 42 nuevos más el actualizado).
 
-- [Documentación oficial de Kibana Discover](https://www.elastic.co/guide/en/kibana/8.14/discover.html)
-- [Referencia de sintaxis KQL](https://www.elastic.co/guide/en/kibana/8.14/kuery-query.html)
-- [Guía de ES|QL](https://www.elastic.co/guide/en/elasticsearch/reference/8.14/esql.html)
-- [Configuración de reglas de alerta](https://www.elastic.co/guide/en/kibana/8.14/alerting-getting-started.html)
-- [Lens visualization editor](https://www.elastic.co/guide/en/kibana/8.14/lens.html)
+### Resultado esperado
+
+-   Data stream `logs-mercanova.web-default` con **26 640** eventos
+    estructurados, geolocalizados y con navegador, y **0** fallas de
+    grok.
+-   640 respuestas 504 y 749 eventos con la etiqueta `server_error`.
+-   Índice `orders` con **1 842** pedidos y el pedido 88011 en estado
+    `refunded`.
+-   Logstash ejecuta los pipelines `web` y `orders-jdbc` con una API key
+    guardada en el keystore.
+-   Puedes explicar por qué se descartan los health checks al inicio, por
+    qué `date` no necesita `timezone` en este caso y cómo
+    `document_id` evita duplicados en la lectura incremental.
+
+### Referencias
+
+-   Elastic. *Logstash: Grok filter plugin \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/plugins-filters-grok.html>
+-   Elastic. *Logstash: Jdbc input plugin \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/plugins-inputs-jdbc.html>
+-   Elastic. *Logstash: Elasticsearch output plugin \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/plugins-outputs-elasticsearch.html>
+-   Elastic. *Multiple pipelines \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/multiple-pipelines.html>
+-   Elastic. *Grant access using API keys \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/ls-security.html>
