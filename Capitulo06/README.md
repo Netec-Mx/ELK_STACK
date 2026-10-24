@@ -1,1077 +1,599 @@
-# Corregir un flujo de logs con errores de conectividad, permisos y parsing
+# ELK Stack: Elasticsearch, Logstash y Kibana
 
-## Metadatos
+## Práctica 6. Normalizar, centralizar y hacer resiliente la ingesta
 
-| Campo | Valor |
-|-------|-------|
-| **Duración** | 54 minutos |
-| **Complejidad** | Alta |
-| **Nivel Bloom** | Aplicar |
+### Objetivo
 
-## Descripción General
+Al finalizar la práctica, serás capaz de:
 
-En este laboratorio recibirás un entorno Elastic Stack 8.13.0 deliberadamente degradado con cuatro categorías de fallos inyectados: conectividad TLS entre Elastic Agent y Fleet Server, permisos de archivos de log, errores de parsing en un pipeline de Logstash (Grok y timestamp), y conflictos de mapping en un índice de Elasticsearch. Tu misión es diagnosticar cada problema de forma sistemática, aplicar las correcciones necesarias y validar que el flujo de ingestión queda completamente restaurado con cero documentos rechazados.
+-   Instalar Elastic Agent como Fleet Server y administrar integraciones
+    desde Fleet.
+-   Normalizar a ECS los logs de una aplicación heredada con un ingest
+    pipeline asignado como `default_pipeline`.
+-   Diagnosticar un pipeline de Logstash defectuoso con la API de
+    monitoreo, `rubydebug` y Grok Debugger.
+-   Proteger la ingesta con una cola persistente y recuperar eventos
+    rechazados con la dead letter queue.
 
-## Objetivos de Aprendizaje
+### Objetivo visual
 
-- [ ] Identificar y resolver errores de conectividad entre Elastic Agent y Fleet Server usando logs de diagnóstico y la API de estado del agente
-- [ ] Corregir problemas de permisos en archivos de log y en roles de usuario que impiden la ingestión correcta de eventos
-- [ ] Diagnosticar y reparar errores de parsing incluyendo timestamps mal formateados y patrones Grok incorrectos
-- [ ] Detectar y solucionar conflictos de mapping en índices que causan el rechazo de documentos por parte de Elasticsearch
+![Fleet, ECS, PQ y DLQ](img/lab06.png){width="6.3in"}\
 
-## Prerrequisitos
+### Duración aproximada
 
-### Conocimientos Necesarios
+-   105 minutos.
 
-- Comprensión de la arquitectura de ingestión de logs con Elastic Stack (Elasticsearch, Kibana, Logstash, Elastic Agent, Fleet)
-- Familiaridad con comandos Linux básicos (`chmod`, `chown`, `grep`, `tail`, `curl`)
-- Conocimiento de expresiones Grok y mappings de Elasticsearch
-- Experiencia básica con certificados TLS y `openssl`
+### Prerrequisitos
 
-### Acceso Requerido
+-   Prácticas 2 a 5 completadas: Logstash con la API key en el keystore y
+    las component templates `mercanova-settings` y
+    `mercanova-app-mappings`.
+-   Instalador `elastic-agent-8.19.x-linux-x86_64.tar.gz` en
+    `$LABS/downloads` o acceso a internet.
+-   Archivos `data/lab06/app-legacy.ndjson` (400 eventos) y
+    `data/syslog/syslog-2026.10.19.log` (1 900 líneas).
 
-- Clúster Elasticsearch 8.13.0 operativo en `localhost:9200`
-- Kibana 8.13.0 accesible en `localhost:5601`
-- Fleet Server 8.13.0 en `localhost:8220`
-- Elastic Agent 8.13.0 enrollado con política `lab-policy-default`
-- Logstash 8.13.0 con pipeline activo
-- Acceso `sudo` en el host del laboratorio
+### Instrucciones
 
-## Entorno del Laboratorio
+**Escenario:** MercaNova tiene tres retos de ingesta. Primero, quiere
+dejar de configurar agentes servidor por servidor. Segundo, una
+aplicación heredada escribe logs con nombres propios (`clientip`, `svc`,
+`lvl`) que no se pueden correlacionar con los demás. Tercero, un
+compañero dejó un pipeline de syslog que "no funciona" y nadie sabe por
+qué. Resolverás los tres y harás que la ingesta resista caídas sin
+perder eventos.
 
-### Infraestructura de Servicios
-
-| Servicio | Contenedor | Puerto | Estado Esperado |
-|----------|-----------|--------|-----------------|
-| Elasticsearch | es01 | 9200 | Operativo |
-| Kibana | kibana01 | 5601 | Operativo |
-| Fleet Server | fleet-server01 | 8220 | Operativo |
-| Logstash | logstash01 | 5044 / 8080 | Con errores (a corregir) |
-| Nginx | nginx-app | 80 | Operativo |
-| Python App | python-app | - | Generando logs |
-
-### Credenciales
-
-| Usuario | Contraseña | Uso |
-|---------|-----------|-----|
-| `elastic` | `ElasticLabs2024!` | Administración general |
-| `kibana_system` | `KibanaLabs2024!` | Comunicación Kibana-ES |
-
-### Preparación del Entorno Degradado
-
-Ejecuta el siguiente script para inyectar los cuatro fallos en el entorno operativo. Este script simula un escenario real donde múltiples problemas se acumulan:
-
-```bash
-cd ~/elastic-labs/
-
-# Crear el script de inyección de fallos
-cat > scripts/inject-faults.sh << 'EOF'
-#!/bin/bash
-set -e
-
-echo "=== Inyectando Fallo 1: Conectividad TLS ==="
-# Modificar la URL de Fleet Server en la configuración del agente
-# y reemplazar el certificado CA con uno inválido
-sudo cp /var/log/elastic-agent/elastic-agent-*.ndjson /tmp/agent-backup-log.ndjson 2>/dev/null || true
-
-# Crear un certificado CA falso (expirado)
-openssl req -x509 -newkey rsa:2048 -keyout /tmp/fake-ca.key \
-  -out ~/elastic-labs/config/certs/fake-ca.crt -days 0 -nodes \
-  -subj "/CN=Fake CA/O=Lab Fault Injection" 2>/dev/null
-
-# Sobrescribir la CA del agente con la falsa
-sudo cp ~/elastic-labs/config/certs/fake-ca.crt \
-  /opt/Elastic/Agent/ca.crt
-
-# Modificar la URL de Fleet en la configuración del agente
-sudo sed -i 's|https://fleet-server01:8220|https://fleet-server01:9999|g' \
-  /opt/Elastic/Agent/fleet.yml 2>/dev/null || \
-sudo sed -i 's|url: .*:8220|url: https://fleet-server01:9999|g' \
-  /opt/Elastic/Agent/fleet.enc 2>/dev/null || true
-
-echo "=== Inyectando Fallo 2: Permisos de archivos ==="
-# Cambiar permisos de los logs de nginx a 600:root
-sudo chmod 600 /var/log/nginx/*.log 2>/dev/null || \
-sudo chmod 600 ~/elastic-labs/logs/nginx/*.log 2>/dev/null || true
-sudo chown root:root /var/log/nginx/*.log 2>/dev/null || \
-sudo chown root:root ~/elastic-labs/logs/nginx/*.log 2>/dev/null || true
-
-echo "=== Inyectando Fallo 3: Pipeline Logstash con Grok incorrecto ==="
-# Crear pipeline con patrón Grok que no coincide con el formato real
-cat > ~/elastic-labs/config/logstash/app-logs.conf << 'PIPELINE'
-input {
-  file {
-    path => "/var/log/python-app/app.log"
-    start_position => "beginning"
-    sincedb_path => "/dev/null"
-    codec => plain
-  }
-}
-
-filter {
-  grok {
-    # PATRÓN INCORRECTO: espera formato Apache pero los logs son JSON-like
-    match => { "message" => "%{COMBINEDAPACHELOG}" }
-  }
-  date {
-    # FORMATO INCORRECTO: espera dd/MMM/yyyy pero el log usa ISO8601
-    match => [ "timestamp", "dd/MMM/yyyy:HH:mm:ss Z" ]
-    target => "@timestamp"
-  }
-}
-
-output {
-  elasticsearch {
-    hosts => ["https://es01:9200"]
-    user => "elastic"
-    password => "ElasticLabs2024!"
-    ssl_certificate_authorities => ["/usr/share/logstash/config/certs/ca.crt"]
-    index => "labs-logstash-app-%{+YYYY.MM.dd}"
-  }
-}
-PIPELINE
-
-# Reiniciar Logstash para aplicar el pipeline roto
-docker restart logstash01 2>/dev/null || sudo systemctl restart logstash
-
-echo "=== Inyectando Fallo 4: Conflicto de Mapping ==="
-# Crear un índice con mapping incorrecto para response_code como text
-curl -sk -u elastic:ElasticLabs2024! \
-  -X PUT "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)" \
-  -H "Content-Type: application/json" \
-  -d '{
-  "mappings": {
-    "properties": {
-      "response_code": { "type": "text" },
-      "message": { "type": "text" },
-      "@timestamp": { "type": "date" },
-      "client_ip": { "type": "ip" },
-      "duration_ms": { "type": "float" }
-    }
-  }
-}'
-
-echo ""
-echo "=== Todos los fallos inyectados correctamente ==="
-echo "Fallos activos:"
-echo "  1. Conectividad: URL Fleet incorrecta + certificado CA falso"
-echo "  2. Permisos: logs nginx con permisos 600:root"
-echo "  3. Parsing: Grok pattern incorrecto + date format incorrecto"
-echo "  4. Mapping: response_code definido como 'text' (debería ser 'integer')"
-EOF
-
-chmod +x scripts/inject-faults.sh
-sudo bash scripts/inject-faults.sh
+``` 
+$ source /home/student/labs/scripts/env.sh && cd $LABS
 ```
 
-Espera 30 segundos para que los fallos se manifiesten en los logs antes de comenzar el diagnóstico.
+------------------------------------------------------------------------
 
----
+### Tarea 1. Fleet Server y Elastic Agent
 
-## Procedimiento Paso a Paso
+#### Paso 1. Obtén la huella de la CA del clúster
 
-### Paso 1: Evaluación Inicial del Estado del Entorno
-
-**Objetivo:** Obtener una vista panorámica del estado de todos los componentes para identificar qué flujos están afectados.
-
-**Instrucciones:**
-
-1. Verifica el estado general del clúster Elasticsearch:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cluster/health?pretty"
+``` 
+$ openssl x509 -fingerprint -sha256 -noout -in $CA | \
+  cut -d= -f2 | tr -d ':'
+3F1A9C...E72B
 ```
 
-2. Verifica el estado de los índices relevantes:
+**Qué hace y por qué:** la **huella SHA-256** identifica de forma única
+el certificado de la CA. Elastic Agent la usa para confiar en el clúster
+sin copiar el archivo de la CA a cada servidor. `cut` toma el valor
+después del `=` y `tr` quita los dos puntos.
 
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-*?v&s=index"
+#### Paso 2. Configura Fleet en Kibana
+
+En **Management \> Fleet \> Settings**:
+
+1.  **Fleet Server hosts \> Edit hosts:** `https://elk-lab:8220`.
+2.  **Outputs \> default \> Edit:**
+    -   *Hosts:* `https://elk-lab:9200`
+    -   *Elasticsearch CA trusted fingerprint:* el valor del Paso 1.
+3.  Guarda y aplica.
+
+**Qué hace y por qué:** el **Fleet Server host** es la dirección a la
+que se conectan los agentes para recibir políticas. El **output** es el
+destino de los datos de los agentes; con la huella, cada agente valida
+el certificado HTTPS del clúster. Sin este ajuste, el agente rechazaría
+la conexión por certificado no confiable.
+
+#### Paso 3. Instala Elastic Agent como Fleet Server
+
+En **Fleet \> Agents \> Add Fleet Server**, elige *Quick Start*,
+indica el host `https://elk-lab:8220` y genera el token de servicio.
+Kibana muestra un comando como este; ejecútalo:
+
+``` 
+$ cd $LABS/downloads
+$ tar xzf elastic-agent-$V-linux-x86_64.tar.gz
+$ cd elastic-agent-$V-linux-x86_64
+$ sudo ./elastic-agent install \
+    --fleet-server-es=https://elk-lab:9200 \
+    --fleet-server-service-token=AAEAAWVsYXN0aWMvZmxlZXQtc2... \
+    --fleet-server-policy=fleet-server-policy \
+    --fleet-server-es-ca-trusted-fingerprint=3F1A9C...E72B \
+    --fleet-server-port=8220
 ```
 
-3. Verifica el estado del Elastic Agent:
+**Qué hace y por qué:**
 
-```bash
-sudo elastic-agent status
+| Opción | Significado |
+|-----------------------------------|-------------------------|
+| `install` | Copia el agente a `/opt/Elastic/Agent` y lo registra como servicio `elastic-agent`. |
+| `--fleet-server-es` | Clúster donde Fleet Server guarda el estado de los agentes. |
+| `--fleet-server-service-token` | Credencial de la cuenta de servicio `elastic/fleet-server`. |
+| `--fleet-server-policy` | Política que ejecutará el agente. |
+| `--fleet-server-es-ca-trusted-fingerprint` | Confianza en el certificado del clúster. |
+| `--fleet-server-port` | Puerto en el que escucha a otros agentes (8220). |
+
+#### Paso 4. Verifica el agente
+
+``` 
+$ sudo elastic-agent status
+┌─ fleet
+│  └─ status: (HEALTHY) Connected
+└─ elastic-agent
+   └─ status: (HEALTHY) Running
 ```
 
-4. Revisa los logs recientes del agente buscando errores:
+**Qué hace y por qué:** el agente reporta su estado local; en **Fleet \>
+Agents** verás el host `elk-lab` como **Healthy** con la política
+*Fleet Server Policy*. Solo puede haber **un Elastic Agent por host**,
+así que este agente será el Fleet Server y también ejecutará las
+integraciones de la VM.
 
-```bash
-sudo tail -50 /var/log/elastic-agent/elastic-agent-*.ndjson 2>/dev/null | \
-  grep -i "error\|failed\|refused" | tail -20
+### Tarea 2. Integración de Nginx administrada por Fleet
+
+#### Paso 5. Agrega la integración de Nginx a la política
+
+En **Fleet \> Agent policies \> Fleet Server Policy \> Add integration**,
+elige **Nginx** y configura:
+
+-   *Collect logs from Nginx instances:* activado, con las rutas
+    `/var/log/nginx/access.log*` y `/var/log/nginx/error.log*`.
+-   *Collect metrics from Nginx instances:* desactivado (el Nginx del
+    laboratorio no expone `stub_status`).
+-   Guarda y confirma **Add integration** para desplegarla al agente.
+
+**Qué hace y por qué:** al agregar la integración, Kibana instala en el
+clúster sus **assets** (plantillas, ingest pipelines y dashboards) y
+Fleet actualiza la política. El agente la recibe en segundos, sin editar
+ningún archivo en el servidor: así se administran cientos de agentes.
+
+#### Paso 6. Genera tráfico y revisa los data streams
+
+``` 
+$ $LABS/scripts/traffic.sh 90
 ```
 
-5. Verifica el estado de Logstash:
-
-```bash
-docker logs logstash01 --tail 30 2>/dev/null || \
-  sudo journalctl -u logstash --no-pager -n 30
-```
-
-**Salida Esperada:**
-
-El estado del agente mostrará `DEGRADED` o `FAILED`. Los logs del agente contendrán mensajes como `connection refused` o `x509: certificate signed by unknown authority`. Los logs de Logstash mostrarán `_grokparsefailure` tags.
-
-**Verificación:**
-
-Confirma que puedes identificar al menos tres de los cuatro problemas a partir de la información recopilada. Documenta mentalmente qué componentes están afectados antes de proceder a las correcciones.
-
----
-
-### Paso 2: Corregir el Error de Conectividad (Fleet Server URL + Certificado TLS)
-
-**Objetivo:** Restaurar la comunicación entre Elastic Agent y Fleet Server corrigiendo la URL de Fleet y el certificado CA.
-
-**Instrucciones:**
-
-1. Diagnostica el problema de conectividad verificando la URL configurada:
-
-```bash
-# Ver la configuración actual de Fleet en el agente
-sudo cat /opt/Elastic/Agent/fleet.yml 2>/dev/null | grep -i url
-# o buscar en el archivo encriptado
-sudo elastic-agent inspect 2>/dev/null | grep -i fleet
-```
-
-2. Verifica que Fleet Server está operativo en el puerto correcto:
-
-```bash
-curl -sk --max-time 5 "https://localhost:8220/api/status"
-```
-
-3. Verifica el certificado CA actual del agente:
-
-```bash
-openssl x509 -in /opt/Elastic/Agent/ca.crt -noout -dates -subject 2>/dev/null
-```
-
-Deberías ver que el certificado está expirado (`notAfter` es una fecha pasada o la fecha actual).
-
-4. Restaura el certificado CA correcto:
-
-```bash
-# Copiar el certificado CA válido del stack
-sudo cp ~/elastic-labs/config/certs/ca/ca.crt /opt/Elastic/Agent/ca.crt
-```
-
-5. Verifica que el nuevo certificado es válido:
-
-```bash
-openssl x509 -in /opt/Elastic/Agent/ca.crt -noout -dates -subject
-```
-
-6. Corrige la URL de Fleet Server (de puerto 9999 a 8220):
-
-```bash
-# Corregir la URL en la configuración del agente
-sudo sed -i 's|https://fleet-server01:9999|https://fleet-server01:8220|g' \
-  /opt/Elastic/Agent/fleet.yml 2>/dev/null
-
-# Si el archivo es fleet.enc o la configuración está en otro formato:
-sudo sed -i 's|:9999|:8220|g' /opt/Elastic/Agent/fleet.yml 2>/dev/null
-sudo sed -i 's|:9999|:8220|g' /opt/Elastic/Agent/fleet.enc 2>/dev/null
-```
-
-7. Reinicia el servicio del Elastic Agent:
-
-```bash
-sudo systemctl restart elastic-agent
-```
-
-8. Espera 15 segundos y verifica la reconexión:
-
-```bash
-sleep 15
-sudo elastic-agent status
-```
-
-**Salida Esperada:**
-
-```
-Status: HEALTHY
-Message: Running
-Fleet State: CONNECTED
-Fleet Message: (connected)
-```
-
-**Verificación:**
-
-```bash
-# Confirmar conectividad con Fleet Server usando el certificado correcto
-openssl s_client -connect localhost:8220 \
-  -CAfile /opt/Elastic/Agent/ca.crt </dev/null 2>/dev/null | \
-  grep "Verify return code"
-```
-
-La salida debe mostrar `Verify return code: 0 (ok)`.
-
-Adicionalmente, verifica en Kibana navegando a **Management → Fleet → Agents** que el agente aparece con estado **Healthy** (verde).
-
----
-
-### Paso 3: Corregir los Permisos de Archivos de Log de Nginx
-
-**Objetivo:** Restaurar los permisos de los archivos de log de nginx para que Elastic Agent pueda leerlos.
-
-**Instrucciones:**
-
-1. Identifica el problema de permisos revisando los logs del agente:
-
-```bash
-sudo grep -i "permission denied\|cannot open\|access denied" \
-  /var/log/elastic-agent/filebeat-*.ndjson 2>/dev/null | tail -5
-```
-
-2. Verifica los permisos actuales de los archivos de log de nginx:
-
-```bash
-ls -la /var/log/nginx/*.log 2>/dev/null || \
-ls -la ~/elastic-labs/logs/nginx/*.log
-```
-
-Deberías ver permisos `600` y propietario `root:root`, lo que impide la lectura por otros usuarios.
-
-3. Identifica el usuario bajo el que corre el Elastic Agent:
-
-```bash
-ps aux | grep elastic-agent | grep -v grep | awk '{print $1}'
-```
-
-4. Corrige los permisos para permitir lectura por el grupo:
-
-```bash
-# Opción A: Si el agente corre como root (caso más común)
-# El problema podría estar en un directorio padre. Verificar:
-sudo ls -la /var/log/nginx/ 2>/dev/null
-sudo ls -la ~/elastic-labs/logs/nginx/ 2>/dev/null
-
-# Corregir permisos de los archivos de log
-sudo chmod 644 /var/log/nginx/*.log 2>/dev/null
-sudo chmod 644 ~/elastic-labs/logs/nginx/*.log 2>/dev/null
-
-# Asegurar que el directorio es accesible
-sudo chmod 755 /var/log/nginx/ 2>/dev/null
-sudo chmod 755 ~/elastic-labs/logs/nginx/ 2>/dev/null
-```
-
-5. Si el agente NO corre como root, añadir el usuario al grupo adecuado:
-
-```bash
-# Identificar el grupo del directorio de logs
-NGINX_LOG_DIR="/var/log/nginx"
-[ -d "$NGINX_LOG_DIR" ] || NGINX_LOG_DIR="$HOME/elastic-labs/logs/nginx"
-
-# Cambiar grupo a uno que el agente pueda leer
-sudo chown root:adm ${NGINX_LOG_DIR}/*.log
-sudo chmod 640 ${NGINX_LOG_DIR}/*.log
-
-# Añadir el usuario del agente al grupo adm (si no es root)
-AGENT_USER=$(ps aux | grep elastic-agent | grep -v grep | awk '{print $1}' | head -1)
-if [ "$AGENT_USER" != "root" ]; then
-  sudo usermod -aG adm $AGENT_USER
-fi
-```
-
-6. Verifica que los archivos son ahora legibles:
-
-```bash
-# Simular lectura como el usuario del agente
-sudo -u $(ps aux | grep elastic-agent | grep -v grep | awk '{print $1}' | head -1) \
-  head -5 /var/log/nginx/access.log 2>/dev/null || \
-sudo head -5 ~/elastic-labs/logs/nginx/access.log
-```
-
-7. Fuerza al agente a releer los archivos (reinicio del input):
-
-```bash
-sudo systemctl restart elastic-agent
-sleep 10
-```
-
-**Salida Esperada:**
-
-Los archivos de log deben mostrar permisos `644` o `640` y ser legibles por el proceso del agente. Tras el reinicio, no deben aparecer más errores de `permission denied` en los logs.
-
-**Verificación:**
-
-```bash
-# Verificar que ya no hay errores de permisos en los últimos logs
-sudo grep -i "permission denied" \
-  /var/log/elastic-agent/filebeat-*.ndjson 2>/dev/null | \
-  tail -5 | grep "$(date +%Y-%m-%d)" && \
-  echo "FALLO: Aún hay errores de permisos" || \
-  echo "OK: No hay errores recientes de permisos"
-
-# Verificar que llegan documentos al índice de nginx
-sleep 15
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-nginx-sample/_count?pretty"
-```
-
----
-
-### Paso 4: Corregir el Pipeline de Logstash (Grok y Timestamp)
-
-**Objetivo:** Reparar el patrón Grok y el formato de fecha en el pipeline de Logstash para que los logs de la aplicación Python se parseen correctamente.
-
-**Instrucciones:**
-
-1. Examina el formato real de los logs de la aplicación Python:
-
-```bash
-# Ver las últimas líneas del log de la aplicación
-tail -5 /var/log/python-app/app.log 2>/dev/null || \
-docker logs python-app --tail 5 2>/dev/null || \
-tail -5 ~/elastic-labs/logs/python-app/app.log
-```
-
-El formato real de los logs debería ser similar a:
-
-```
-2025-07-01T14:23:45.123Z INFO [app.main] GET /api/users 200 45ms client=192.168.1.50
-2025-07-01T14:23:46.456Z ERROR [app.auth] POST /api/login 401 12ms client=10.0.0.15
-```
-
-2. Verifica los errores actuales de Logstash:
-
-```bash
-docker logs logstash01 --tail 50 2>/dev/null | grep -i "grokparsefailure\|error\|failed" || \
-sudo journalctl -u logstash --no-pager -n 50 | grep -i "grokparsefailure\|error\|failed"
-```
-
-3. Verifica los documentos con `_grokparsefailure` en Elasticsearch:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_search?pretty" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": { "match": { "tags": "_grokparsefailure" } },
-    "size": 2
-  }'
-```
-
-4. Usa el Grok Debugger de Kibana o la línea de comandos para construir el patrón correcto. Basándote en el formato del log:
-
-```
-2025-07-01T14:23:45.123Z INFO [app.main] GET /api/users 200 45ms client=192.168.1.50
-```
-
-El patrón Grok correcto es:
-
-```
-%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:log_level} \[%{DATA:logger}\] %{WORD:http_method} %{URIPATH:request_path} %{NUMBER:response_code:int} %{NUMBER:duration}ms client=%{IP:client_ip}
-```
-
-5. Corrige el pipeline de Logstash con el patrón Grok y formato de fecha correctos:
-
-```bash
-cat > ~/elastic-labs/config/logstash/app-logs.conf << 'PIPELINE'
-input {
-  file {
-    path => "/var/log/python-app/app.log"
-    start_position => "beginning"
-    sincedb_path => "/dev/null"
-    codec => plain
-  }
-}
-
-filter {
-  grok {
-    match => { 
-      "message" => "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:log_level} \[%{DATA:logger}\] %{WORD:http_method} %{URIPATH:request_path} %{NUMBER:response_code:int} %{NUMBER:duration_ms:float}ms client=%{IP:client_ip}" 
-    }
-    tag_on_failure => ["_grokparsefailure"]
-  }
-  
-  date {
-    match => [ "timestamp", "ISO8601" ]
-    target => "@timestamp"
-    remove_field => ["timestamp"]
-  }
-  
-  mutate {
-    convert => {
-      "response_code" => "integer"
-      "duration_ms" => "float"
-    }
-  }
-}
-
-output {
-  elasticsearch {
-    hosts => ["https://es01:9200"]
-    user => "elastic"
-    password => "ElasticLabs2024!"
-    ssl_certificate_authorities => ["/usr/share/logstash/config/certs/ca.crt"]
-    index => "labs-logstash-app-%{+YYYY.MM.dd}"
-  }
-}
-PIPELINE
-```
-
-6. Copia el pipeline corregido al contenedor y reinicia Logstash:
-
-```bash
-# Si Logstash corre en Docker
-docker cp ~/elastic-labs/config/logstash/app-logs.conf \
-  logstash01:/usr/share/logstash/pipeline/app-logs.conf
-docker restart logstash01
-
-# Si Logstash corre como servicio nativo
-sudo cp ~/elastic-labs/config/logstash/app-logs.conf \
-  /etc/logstash/conf.d/app-logs.conf
-sudo systemctl restart logstash
-```
-
-7. Espera a que Logstash se reinicie completamente:
-
-```bash
-sleep 30
-
-# Verificar que Logstash está operativo
-curl -s "http://localhost:9600/_node/stats/pipelines?pretty" 2>/dev/null | \
-  grep -A5 "events" || \
-docker logs logstash01 --tail 10 2>/dev/null | grep -i "pipeline\|started"
-```
-
-**Salida Esperada:**
-
-Los logs de Logstash deben mostrar `Pipeline started` sin errores. Los nuevos documentos indexados no deben tener el tag `_grokparsefailure`.
-
-**Verificación:**
-
-```bash
-# Esperar a que se procesen nuevos logs
-sleep 20
-
-# Buscar documentos recientes SIN errores de parsing
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_search?pretty" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": {
-      "bool": {
-        "must_not": [
-          { "match": { "tags": "_grokparsefailure" } }
-        ],
-        "must": [
-          { "exists": { "field": "log_level" } },
-          { "exists": { "field": "client_ip" } }
-        ]
-      }
-    },
-    "size": 2,
-    "sort": [{"@timestamp": "desc"}]
-  }'
-```
-
-Deberías ver documentos con campos `log_level`, `http_method`, `request_path`, `response_code`, `duration_ms` y `client_ip` correctamente parseados.
-
----
-
-### Paso 5: Resolver el Conflicto de Mapping (response_code: text → integer)
-
-**Objetivo:** Eliminar el conflicto de mapping que causa el rechazo de documentos donde `response_code` se envía como entero pero el mapping lo define como texto.
-
-**Instrucciones:**
-
-1. Diagnostica el conflicto verificando los documentos rechazados:
-
-```bash
-# Buscar errores de mapping en los logs de Logstash
-docker logs logstash01 --tail 100 2>/dev/null | \
-  grep -i "mapper_parsing_exception\|illegal_argument\|rejected" || \
-sudo journalctl -u logstash --no-pager -n 100 | \
-  grep -i "mapper_parsing_exception\|rejected"
-```
-
-2. Verifica el mapping actual del índice problemático:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)/_mapping?pretty" | \
-  grep -A3 "response_code"
-```
-
-Deberías ver:
-
-```json
-"response_code" : {
-  "type" : "text"
+``` 
+GET _data_stream/logs-nginx.*?filter_path=data_streams.name
+
+GET logs-nginx.access-default/_search
+{
+  "size": 1,
+  "_source": [ "source.address", "url.original",
+               "http.response.status_code", "user_agent.name",
+               "data_stream", "event.dataset" ]
 }
 ```
 
-Pero el pipeline envía `response_code` como `integer` (por la conversión en el filtro `mutate`).
+**Qué hace y por qué:** `traffic.sh` genera peticiones reales al Nginx
+local. La integración escribe en `logs-nginx.access-default` y
+`logs-nginx.error-default`, con los campos ya normalizados a **ECS** y
+enriquecidos. No escribiste ni un patrón grok: lo hace el ingest pipeline
+de la integración.
 
-3. La solución requiere eliminar el índice con mapping incorrecto y permitir que Logstash lo recree con el mapping correcto. Primero, crea un index template que garantice el mapping correcto para futuros índices:
+#### Paso 7. Explora lo que instaló la integración
 
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  -X PUT "https://localhost:9200/_index_template/labs-logstash-template" \
-  -H "Content-Type: application/json" \
-  -d '{
-  "index_patterns": ["labs-logstash-app-*"],
-  "priority": 200,
+``` 
+GET _index_template/logs-nginx.access?filter_path=*.*.composed_of
+GET _ingest/pipeline/logs-nginx.access-*?filter_path=*.description
+GET _ilm/policy/logs?filter_path=*.policy.phases.hot
+```
+
+En **Analytics \> Dashboards**, abre
+**\[Logs Nginx\] Access and error logs**.
+
+**Qué hace y por qué:** una integración es un paquete con **inputs,
+plantillas, ingest pipelines, política de retención y dashboards**.
+Comparar este resultado con el pipeline que escribiste a mano en la
+práctica 5 muestra la ventaja: para fuentes comunes conviene la
+integración; Logstash brilla con fuentes propias o con enrutamientos
+complejos.
+
+### Tarea 3. Normalizar a ECS los logs heredados
+
+#### Paso 8. Revisa el formato heredado
+
+``` 
+$ sed -n 2p data/lab06/app-legacy.ndjson
+{"time": "19/10/2026 00:27", "clientip": "187.41.49.91",
+ "svc": "cart", "lvl": "INFO", "message": "Request processed"}
+```
+
+**Qué hace y por qué:** cada campo tiene un nombre propio y la fecha
+viene como texto en formato día/mes/año **sin zona horaria**. Si se
+indexara así, no se podría correlacionar con los logs del resto de la
+plataforma, que usan `source.ip`, `service.name`, `log.level` y
+`@timestamp`.
+
+#### Paso 9. Crea el ingest pipeline de normalización
+
+``` 
+PUT _ingest/pipeline/mercanova-app-ecs
+{
+  "description": "Normaliza a ECS los logs heredados",
+  "processors": [
+    { "rename": { "field": "clientip",
+        "target_field": "source.ip", "ignore_missing": true } },
+    { "rename": { "field": "svc",
+        "target_field": "service.name" } },
+    { "lowercase": { "field": "lvl" } },
+    { "rename": { "field": "lvl", "target_field": "log.level" } },
+    { "date": { "field": "time",
+        "formats": [ "dd/MM/yyyy HH:mm" ],
+        "timezone": "America/Mexico_City" } },
+    { "set": { "field": "event.outcome", "value": "failure",
+        "if": "ctx.log?.level == 'error'" } },
+    { "remove": { "field": "time" } }
+  ],
+  "on_failure": [
+    { "set": { "field": "error.message",
+        "value": "{{ _ingest.on_failure_message }}" } }
+  ]
+}
+```
+
+**Qué hace y por qué:**
+
+| Procesador / opción | Por qué |
+|------------------------|------------------------------------|
+| `rename` + `ignore_missing` | Si un evento no trae IP, el procesador continúa en lugar de fallar. |
+| `lowercase` antes de `rename` | Normaliza `ERROR` → `error` para que coincida con los logs de la práctica 3. |
+| `date` con `timezone` | La fecha no indica zona: se interpreta como hora de México y se guarda en UTC. Sin `timezone` se supondría UTC y los eventos quedarían 6 horas desfasados. |
+| `set` con `if` | Condición en Painless; `?.` evita un error si `log` no existe. |
+| `on_failure` | Conserva el documento y documenta el error. |
+
+#### Paso 10. Simula el pipeline con un evento real
+
+``` 
+POST _ingest/pipeline/mercanova-app-ecs/_simulate
+{
+  "docs": [ { "_source": {
+    "time": "19/10/2026 14:32", "clientip": "203.0.113.7",
+    "svc": "checkout", "lvl": "ERROR",
+    "message": "Request failed" } } ]
+}
+```
+
+**Qué hace y por qué:** el resultado muestra `source.ip`,
+`service.name: checkout`, `log.level: error`,
+`event.outcome: failure` y `@timestamp: 2026-10-19T20:32:00.000Z`: las
+14:32 de México son las 20:32 UTC.
+
+#### Paso 11. Crea la plantilla y carga los datos
+
+``` 
+PUT _index_template/mercanova-legacy
+{
+  "index_patterns": [ "logs-mercanova.legacy-*" ],
+  "data_stream": {},
+  "composed_of": [ "mercanova-settings",
+                   "mercanova-app-mappings" ],
+  "priority": 500,
   "template": {
     "settings": {
-      "number_of_shards": 1,
-      "number_of_replicas": 0
-    },
-    "mappings": {
-      "properties": {
-        "@timestamp": { "type": "date" },
-        "message": { "type": "text" },
-        "log_level": { "type": "keyword" },
-        "logger": { "type": "keyword" },
-        "http_method": { "type": "keyword" },
-        "request_path": { "type": "keyword" },
-        "response_code": { "type": "integer" },
-        "duration_ms": { "type": "float" },
-        "client_ip": { "type": "ip" },
-        "tags": { "type": "keyword" }
-      }
-    }
+      "index.default_pipeline": "mercanova-app-ecs" },
+    "mappings": { "properties": {
+      "source": { "properties": { "ip": { "type": "ip" } } },
+      "event":  { "properties": {
+        "outcome": { "type": "keyword" } } } } }
   }
-}'
-```
-
-4. Verifica que el template se creó correctamente:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_index_template/labs-logstash-template?pretty" | \
-  grep -A2 "response_code"
-```
-
-5. Si hay documentos valiosos en el índice actual, reindéxalos a un índice temporal antes de eliminar:
-
-```bash
-# Verificar si hay documentos en el índice actual
-DOC_COUNT=$(curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)/_count" | \
-  python3 -c "import sys,json; print(json.load(sys.stdin).get('count',0))")
-
-echo "Documentos en el índice actual: $DOC_COUNT"
-
-if [ "$DOC_COUNT" -gt "0" ]; then
-  echo "Reindexando documentos válidos..."
-  curl -sk -u elastic:ElasticLabs2024! \
-    -X POST "https://localhost:9200/_reindex" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"source\": {
-        \"index\": \"labs-logstash-app-$(date +%Y.%m.%d)\",
-        \"query\": {
-          \"bool\": {
-            \"must_not\": [
-              { \"match\": { \"tags\": \"_grokparsefailure\" } }
-            ]
-          }
-        }
-      },
-      \"dest\": {
-        \"index\": \"labs-logstash-app-backup\"
-      }
-    }"
-fi
-```
-
-6. Elimina el índice con mapping incorrecto:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  -X DELETE "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)?pretty"
-```
-
-7. Reinicia Logstash para que recree el índice con el template correcto:
-
-```bash
-docker restart logstash01 2>/dev/null || sudo systemctl restart logstash
-sleep 30
-```
-
-8. Verifica que el nuevo índice se creó con el mapping correcto:
-
-```bash
-# Esperar a que Logstash procese nuevos eventos
-sleep 20
-
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)/_mapping?pretty" | \
-  grep -A3 "response_code"
-```
-
-**Salida Esperada:**
-
-```json
-"response_code" : {
-  "type" : "integer"
 }
 ```
 
-**Verificación:**
-
-```bash
-# Verificar que no hay documentos rechazados
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)/_search?pretty" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": { "match_all": {} },
-    "size": 3,
-    "sort": [{"@timestamp": "desc"}]
-  }' | grep -E "response_code|duration_ms|client_ip"
+``` 
+$ scripts/bulk-load.sh logs-mercanova.legacy-default \
+      data/lab06/app-legacy.ndjson
+Operaciones: 400  ·  con error: 0
 ```
 
-Los campos `response_code` deben aparecer como valores numéricos (200, 401, 500, etc.) y `client_ip` como direcciones IP válidas.
+**Qué hace y por qué:** la plantilla **reutiliza** los mappings de los
+logs de aplicación y agrega solo lo nuevo (`source.ip` de tipo `ip`).
+Con `default_pipeline`, quien envía los datos no necesita saber que
+existe la normalización.
 
----
+#### Paso 12. Correlaciona las dos fuentes de aplicación
 
-### Paso 6: Validación Integral del Flujo Restaurado
-
-**Objetivo:** Confirmar que todos los cuatro problemas han sido resueltos y el flujo de ingestión funciona de extremo a extremo sin errores.
-
-**Instrucciones:**
-
-1. Verifica el estado completo del Elastic Agent:
-
-```bash
-sudo elastic-agent status
+``` 
+POST _query?format=txt
+{
+  "query": """
+    FROM logs-mercanova.app-*, logs-mercanova.legacy-*
+    | WHERE log.level == "error"
+    | STATS errores = COUNT(*) BY service.name
+    | SORT errores DESC
+  """
+}
 ```
 
-2. Verifica que no hay errores recientes en los logs del agente:
+**Qué hace y por qué:** una sola consulta combina los logs modernos y
+los heredados porque ahora comparten nombres de campos. Resultado
+esperado: payment 412, checkout 111 (97 + 14 heredados), cart 18
+(15 + 3) y catalog 14 (todos heredados). En total, los 31 errores
+heredados se suman a los 524 de la práctica 3.
 
-```bash
-sudo grep -c "error" /var/log/elastic-agent/elastic-agent-*.ndjson 2>/dev/null | \
-  awk -F: '{sum+=$2} END {print "Total errores en logs: " sum}'
+### Tarea 4. Diagnosticar el pipeline de syslog
 
-# Verificar solo errores de los últimos 5 minutos
-sudo grep "$(date -u +%Y-%m-%dT%H:%M 2>/dev/null || date +%Y-%m-%dT%H:%M)" \
-  /var/log/elastic-agent/elastic-agent-*.ndjson 2>/dev/null | \
-  grep -ic "error" || echo "0 errores recientes"
+#### Paso 13. Crea la plantilla del data stream de syslog
+
+``` 
+PUT _index_template/mercanova-syslog
+{
+  "index_patterns": [ "logs-mercanova.syslog-*" ],
+  "data_stream": {},
+  "composed_of": [ "ecs@mappings", "mercanova-settings" ],
+  "priority": 500,
+  "template": {
+    "mappings": { "properties": {
+      "process": { "properties": {
+        "name": { "type": "keyword" },
+        "pid":  { "type": "long" } } },
+      "host": { "properties": {
+        "name": { "type": "keyword" } } } } }
+  }
+}
 ```
 
-3. Verifica el conteo de documentos en todos los índices del laboratorio:
+**Qué hace y por qué:** `process.pid` se declara `long`, como define
+ECS. Esta decisión, correcta, será la que más adelante envíe algunos
+eventos a la dead letter queue.
 
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-*?v&s=index&h=index,docs.count,store.size"
-```
+#### Paso 14. Activa el pipeline defectuoso con cola persistente y DLQ
 
-4. Verifica que Logstash no tiene documentos con errores de parsing:
+``` 
+$ cd /opt/elastic/logstash
+$ sudo cp pipelines/syslog-broken.conf pipelines/syslog.conf
+$ sudo tee -a config/pipelines.yml > /dev/null <<'EOF'
 
-```bash
-FAILURES=$(curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_count" \
-  -H "Content-Type: application/json" \
-  -d '{"query":{"match":{"tags":"_grokparsefailure"}}}' | \
-  python3 -c "import sys,json; print(json.load(sys.stdin).get('count',0))")
-
-TOTAL=$(curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_count" | \
-  python3 -c "import sys,json; print(json.load(sys.stdin).get('count',0))")
-
-echo "Documentos totales en labs-logstash-app-*: $TOTAL"
-echo "Documentos con _grokparsefailure: $FAILURES"
-echo "Tasa de éxito de parsing: $(echo "scale=1; ($TOTAL-$FAILURES)*100/$TOTAL" | bc 2>/dev/null || echo 'N/A')%"
-```
-
-5. Envía un documento de prueba manual para confirmar que no hay conflictos de mapping:
-
-```bash
-curl -sk -u elastic:ElasticLabs2024! \
-  -X POST "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)/_doc" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "@timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'",
-    "message": "TEST validation document",
-    "log_level": "INFO",
-    "logger": "validation.test",
-    "http_method": "GET",
-    "request_path": "/api/health",
-    "response_code": 200,
-    "duration_ms": 5.2,
-    "client_ip": "127.0.0.1"
-  }'
-```
-
-**Salida Esperada:**
-
-```json
-{"_index":"labs-logstash-app-2025.07.01","_id":"...","_version":1,"result":"created",...}
-```
-
-No debe haber errores de tipo `mapper_parsing_exception`.
-
----
-
-## Validación y Testing
-
-Ejecuta el siguiente script de validación completa para confirmar que todos los objetivos se han cumplido:
-
-```bash
-cat > ~/elastic-labs/scripts/validate-lab06.sh << 'EOF'
-#!/bin/bash
-echo "╔══════════════════════════════════════════════════════╗"
-echo "║  VALIDACIÓN COMPLETA - Lab 06-00-01                  ║"
-echo "╚══════════════════════════════════════════════════════╝"
-echo ""
-
-PASS=0
-FAIL=0
-
-# Test 1: Elastic Agent conectado a Fleet
-echo -n "[TEST 1] Elastic Agent conectado a Fleet Server... "
-AGENT_STATUS=$(sudo elastic-agent status 2>/dev/null | grep -i "fleet state" | grep -ci "connected")
-if [ "$AGENT_STATUS" -ge "1" ]; then
-  echo "✅ PASS"
-  ((PASS++))
-else
-  echo "❌ FAIL - Agent no conectado a Fleet"
-  ((FAIL++))
-fi
-
-# Test 2: Certificado TLS válido
-echo -n "[TEST 2] Certificado CA válido para Fleet Server... "
-CERT_VALID=$(openssl x509 -in /opt/Elastic/Agent/ca.crt -checkend 86400 -noout 2>/dev/null && echo "valid" || echo "expired")
-if [ "$CERT_VALID" = "valid" ]; then
-  echo "✅ PASS"
-  ((PASS++))
-else
-  echo "❌ FAIL - Certificado expirado o inválido"
-  ((FAIL++))
-fi
-
-# Test 3: Permisos de archivos de log nginx
-echo -n "[TEST 3] Permisos de logs nginx legibles... "
-NGINX_LOG="/var/log/nginx/access.log"
-[ -f "$NGINX_LOG" ] || NGINX_LOG="$HOME/elastic-labs/logs/nginx/access.log"
-if [ -r "$NGINX_LOG" ]; then
-  PERMS=$(stat -c %a "$NGINX_LOG" 2>/dev/null || stat -f %Lp "$NGINX_LOG" 2>/dev/null)
-  if [ "$PERMS" != "600" ]; then
-    echo "✅ PASS (permisos: $PERMS)"
-    ((PASS++))
-  else
-    echo "❌ FAIL - Permisos aún son 600"
-    ((FAIL++))
-  fi
-else
-  echo "⚠️  SKIP - Archivo no encontrado"
-  ((PASS++))
-fi
-
-# Test 4: Pipeline Logstash sin grokparsefailure recientes
-echo -n "[TEST 4] Logstash sin errores de parsing recientes... "
-GROK_FAILS=$(curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-*/_count" \
-  -H "Content-Type: application/json" \
-  -d '{"query":{"bool":{"must":[{"match":{"tags":"_grokparsefailure"}},{"range":{"@timestamp":{"gte":"now-5m"}}}]}}}' 2>/dev/null | \
-  python3 -c "import sys,json; print(json.load(sys.stdin).get('count',0))" 2>/dev/null)
-if [ "${GROK_FAILS:-0}" -eq "0" ]; then
-  echo "✅ PASS (0 fallos de Grok en últimos 5 min)"
-  ((PASS++))
-else
-  echo "❌ FAIL - $GROK_FAILS documentos con _grokparsefailure"
-  ((FAIL++))
-fi
-
-# Test 5: Mapping de response_code es integer
-echo -n "[TEST 5] Mapping response_code = integer... "
-MAPPING_TYPE=$(curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)/_mapping" 2>/dev/null | \
-  python3 -c "
-import sys,json
-data = json.load(sys.stdin)
-for idx in data:
-  props = data[idx].get('mappings',{}).get('properties',{})
-  if 'response_code' in props:
-    print(props['response_code'].get('type','unknown'))
-    break
-" 2>/dev/null)
-if [ "$MAPPING_TYPE" = "integer" ]; then
-  echo "✅ PASS"
-  ((PASS++))
-else
-  echo "❌ FAIL - Tipo actual: ${MAPPING_TYPE:-no encontrado}"
-  ((FAIL++))
-fi
-
-# Test 6: Documento de prueba se indexa sin error
-echo -n "[TEST 6] Indexación de documento sin conflicto... "
-RESULT=$(curl -sk -u elastic:ElasticLabs2024! \
-  -X POST "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)/_doc" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"@timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",
-    \"message\": \"validation test\",
-    \"log_level\": \"INFO\",
-    \"response_code\": 200,
-    \"duration_ms\": 1.5,
-    \"client_ip\": \"10.0.0.1\"
-  }" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('result','error'))" 2>/dev/null)
-if [ "$RESULT" = "created" ]; then
-  echo "✅ PASS"
-  ((PASS++))
-else
-  echo "❌ FAIL - Resultado: ${RESULT:-error de conexión}"
-  ((FAIL++))
-fi
-
-echo ""
-echo "════════════════════════════════════════════════════════"
-echo "  Resultados: $PASS pasados / $FAIL fallidos de $((PASS+FAIL)) tests"
-echo "════════════════════════════════════════════════════════"
-
-if [ "$FAIL" -eq "0" ]; then
-  echo "  🎉 ¡LABORATORIO COMPLETADO EXITOSAMENTE!"
-else
-  echo "  ⚠️  Revisa los tests fallidos antes de continuar."
-fi
+- pipeline.id: syslog
+  path.config: "/opt/elastic/logstash/pipelines/syslog.conf"
+  pipeline.workers: 1
+  queue.type: persisted
+  queue.max_bytes: 512mb
+  dead_letter_queue.enable: true
+  dead_letter_queue.max_bytes: 256mb
 EOF
-
-chmod +x ~/elastic-labs/scripts/validate-lab06.sh
-bash ~/elastic-labs/scripts/validate-lab06.sh
+$ sudo chown -R elastic:elastic pipelines config
+$ sudo systemctl restart logstash
 ```
 
-**Criterio de éxito:** Los 6 tests deben pasar (✅) para considerar el laboratorio completado.
+**Qué hace y por qué:**
 
----
+| Ajuste | Efecto |
+|------------------------|------------------------------------|
+| `queue.type: persisted` | Los eventos se escriben en disco (`data/queue/syslog`) antes de procesarse: sobreviven a reinicios y caídas. |
+| `queue.max_bytes` | Tamaño máximo; al llenarse, el input deja de aceptar eventos (backpressure). |
+| `dead_letter_queue.enable` | Los eventos que Elasticsearch rechaza con 400 o 404 se guardan en `data/dead_letter_queue/syslog`. |
+| `dead_letter_queue.max_bytes` | Límite de la DLQ en disco. |
 
-## Resolución de Problemas
+#### Paso 15. Envía el syslog y observa los síntomas
 
-### Problema 1: El agente sigue en estado DEGRADED después de corregir la URL y el certificado
-
-**Síntomas:**
-- `elastic-agent status` muestra `Status: DEGRADED` con mensaje `1 or more components/units are not healthy`
-- Fleet State aparece como `CONNECTED` pero los componentes individuales (filebeat, metricbeat) están en `FAILED`
-
-**Causa:**
-El agente se reconectó a Fleet exitosamente, pero la política descargada todavía contiene referencias a la configuración anterior. Además, el sub-proceso filebeat puede tener un archivo de estado (`registry`) corrupto que le impide reiniciar correctamente el seguimiento de archivos.
-
-**Solución:**
-
-```bash
-# 1. Verificar qué componente específico está fallando
-sudo elastic-agent status | grep -A2 "FAILED\|DEGRADED"
-
-# 2. Limpiar el registry de filebeat (fuerza re-lectura de archivos)
-sudo find /var/lib/elastic-agent/ -name "registry" -type d -exec rm -rf {} + 2>/dev/null
-sudo find /opt/Elastic/Agent/data/ -name "registry" -type d -exec rm -rf {} + 2>/dev/null
-
-# 3. Reiniciar completamente el agente
-sudo systemctl stop elastic-agent
-sleep 5
-sudo systemctl start elastic-agent
-
-# 4. Esperar 30 segundos y verificar
-sleep 30
-sudo elastic-agent status
+``` 
+$ scripts/send-syslog.sh
+Enviadas 1900 líneas a localhost:5514
+$ curl -s localhost:9600/_node/stats/pipelines/syslog | jq '
+  .pipelines.syslog.plugins.filters[] | {id, events}'
 ```
 
-Si el problema persiste, verifica que la política en Fleet no tiene errores navegando a **Kibana → Fleet → Agent policies → lab-policy-default** y revisando las integraciones configuradas.
-
----
-
-### Problema 2: Logstash indexa documentos pero response_code sigue apareciendo como texto
-
-**Síntomas:**
-- El index template se creó correctamente (se puede verificar con `_index_template`)
-- Sin embargo, el índice del día actual sigue teniendo `response_code` como `text`
-- Los nuevos documentos se rechazan con `mapper_parsing_exception`
-
-**Causa:**
-El índice del día actual fue creado ANTES de que se aplicara el index template. Los index templates solo afectan a índices NUEVOS; no modifican el mapping de índices existentes. Si el índice no se eliminó correctamente o Logstash lo recreó antes de que el template estuviera activo, el conflicto persiste.
-
-**Solución:**
-
-```bash
-# 1. Verificar que el template existe y tiene prioridad correcta
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_index_template/labs-logstash-template?pretty" | \
-  grep -E "priority|response_code"
-
-# 2. Detener Logstash temporalmente para evitar que recree el índice
-docker stop logstash01 2>/dev/null || sudo systemctl stop logstash
-
-# 3. Eliminar el índice problemático
-curl -sk -u elastic:ElasticLabs2024! \
-  -X DELETE "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)"
-
-# 4. Verificar que no existe
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-logstash-app-*?v"
-
-# 5. Reiniciar Logstash - el template se aplicará al crear el nuevo índice
-docker start logstash01 2>/dev/null || sudo systemctl start logstash
-
-# 6. Esperar y verificar el mapping del nuevo índice
-sleep 40
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/labs-logstash-app-$(date +%Y.%m.%d)/_mapping?pretty" | \
-  grep -A3 "response_code"
+``` 
+GET logs-mercanova.syslog-default/_count
+{ "query": { "term": { "tags": "_grokparsefailure" } } }
 ```
 
-La clave es que **el template debe existir ANTES de que se cree el índice**. El orden correcto es: crear template → eliminar índice viejo → dejar que Logstash cree el índice nuevo.
+**Qué hace y por qué:** los eventos **llegan**, pero el conteo de
+`_grokparsefailure` es **1 900**: ninguna línea coincidió con el patrón.
+En la API, el filtro `grok-syslog` procesó todos los eventos sin extraer
+campos. Primer error encontrado.
 
----
+#### Paso 16. Encuentra la causa con Grok Debugger
 
-## Limpieza
+Copia una línea del archivo y el patrón del pipeline en **Dev Tools \>
+Grok Debugger**:
 
-Una vez completado y validado el laboratorio, ejecuta los siguientes comandos para dejar el entorno limpio como base para el siguiente laboratorio:
-
-```bash
-# Eliminar archivos temporales de la inyección de fallos
-rm -f /tmp/fake-ca.key
-rm -f ~/elastic-labs/config/certs/fake-ca.crt
-rm -f ~/elastic-labs/scripts/inject-faults.sh
-
-# Eliminar el índice de backup si se creó
-curl -sk -u elastic:ElasticLabs2024! \
-  -X DELETE "https://localhost:9200/labs-logstash-app-backup" 2>/dev/null
-
-# Eliminar documentos con _grokparsefailure del período de pruebas
-curl -sk -u elastic:ElasticLabs2024! \
-  -X POST "https://localhost:9200/labs-logstash-app-*/_delete_by_query" \
-  -H "Content-Type: application/json" \
-  -d '{"query":{"match":{"tags":"_grokparsefailure"}}}'
-
-# Verificar estado final limpio
-echo ""
-echo "=== Estado Final del Entorno ==="
-sudo elastic-agent status | head -5
-echo ""
-curl -sk -u elastic:ElasticLabs2024! \
-  "https://localhost:9200/_cat/indices/labs-*?v&s=index&h=index,health,docs.count"
-echo ""
-echo "Entorno listo para el siguiente laboratorio."
+``` 
+2026-10-19 14:05:12 srv-app01 sshd[2231]: Failed password for root
+from 89.160.20.12 port 52211 ssh2
 ```
 
----
+``` 
+^%{TIMESTAMP_ISO8601:ts} %{DATA:[process][name]}\[%{POSINT:
+[process][pid]}\]: %{GREEDYDATA:msg}$
+```
 
-## Resumen
+**Qué hace y por qué:** el patrón no contempla el **nombre del host**
+(`srv-app01`) entre la fecha y el proceso. Además, exige un `[pid]`
+numérico, pero hay líneas como `kernel: ...` (sin pid) y
+`CRON[-]: ...` (pid no numérico). Prueba este patrón corregido:
 
-En este laboratorio has aplicado un flujo de diagnóstico sistemático para resolver cuatro categorías de problemas comunes en la ingestión de logs con Elastic Stack:
+``` 
+^%{TIMESTAMP_ISO8601:ts} %{HOSTNAME:[host][name]}
+%{DATA:[process][name]}(?:\[%{DATA:[process][pid]}\])?:
+%{GREEDYDATA:message}$
+```
 
-| Problema | Herramienta de Diagnóstico | Solución Aplicada |
-|----------|---------------------------|-------------------|
-| Conectividad TLS | `elastic-agent status`, `openssl s_client` | Restaurar CA válida + corregir URL de Fleet |
-| Permisos de archivos | `ls -la`, logs de filebeat con `permission denied` | `chmod 644` sobre archivos de log |
-| Parsing Grok/Date | Grok Debugger, búsqueda de `_grokparsefailure` | Reescribir patrón Grok + formato `ISO8601` |
-| Conflicto de Mapping | `_mapping` API, `mapper_parsing_exception` | Index template + eliminar/recrear índice |
+(Escríbelo en una sola línea). El grupo `(?: ... )?` hace opcional el
+pid, y `DATA` acepta cualquier valor entre corchetes.
 
-**Conceptos clave reforzados:**
+#### Paso 17. Corrige el patrón y la zona horaria
 
-- El comando `elastic-agent status` es el punto de partida para cualquier diagnóstico del agente
-- Los certificados TLS expirados o incorrectos son una causa frecuente y silenciosa de pérdida de datos
-- Los index templates solo aplican a índices nuevos; los índices existentes requieren reindexación o recreación
-- El diagnóstico efectivo requiere un enfoque por capas: servicio → red → autenticación → datos
+Edita `pipelines/syslog.conf`:
 
-### Recursos Adicionales
+``` 
+grok {
+  id => "grok-syslog"
+  match => { "message" => "^%{TIMESTAMP_ISO8601:ts}
+    %{HOSTNAME:[host][name]} %{DATA:[process][name]}
+    (?:\[%{DATA:[process][pid]}\])?: %{GREEDYDATA:message}$" }
+  overwrite => [ "message" ]
+}
+date {
+  id => "date-syslog"
+  match => [ "ts", "yyyy-MM-dd HH:mm:ss" ]
+  timezone => "America/Mexico_City"
+  target => "@timestamp"
+  remove_field => [ "ts" ]
+}
+```
 
-- [Elastic Agent Troubleshooting Guide](https://www.elastic.co/guide/en/fleet/8.13/fleet-troubleshooting.html)
-- [Logstash Grok Filter Plugin](https://www.elastic.co/guide/en/logstash/8.13/plugins-filters-grok.html)
-- [Elasticsearch Index Templates](https://www.elastic.co/guide/en/elasticsearch/reference/8.13/index-templates.html)
-- [Elasticsearch Mapping Conflicts](https://www.elastic.co/guide/en/elasticsearch/reference/8.13/mapping.html#mapping-limit-settings)
+(El patrón va en una sola línea dentro de las comillas.)
+
+**Qué hace y por qué:** `overwrite => ["message"]` reemplaza la línea
+completa por el mensaje limpio, sin fecha ni host. El segundo error
+estaba en `date`: `timezone => "UTC"` hacía que las 14:05 de México se
+guardaran como 14:05 UTC, es decir, **6 horas antes** de la realidad. En
+un incidente, eso desordena la línea de tiempo frente a las demás
+fuentes. Con `config.reload.automatic`, Logstash recarga el pipeline al
+guardar el archivo.
+
+#### Paso 18. Prepara una carga limpia
+
+``` 
+DELETE _data_stream/logs-mercanova.syslog-default
+```
+
+**Qué hace y por qué:** elimina los 1 900 eventos mal procesados. Al
+reenviar, el data stream se creará de nuevo con la plantilla.
+
+### Tarea 5. Cola persistente y dead letter queue
+
+#### Paso 19. Simula la caída del destino
+
+``` 
+$ sudo systemctl stop es@01
+$ scripts/send-syslog.sh
+$ curl -s localhost:9600/_node/stats/pipelines/syslog | jq '
+  .pipelines.syslog.queue | {type, events_count,
+  queue_size_in_bytes}'
+{ "type": "persisted", "events_count": 1900, ... }
+```
+
+**Qué hace y por qué:** el pipeline envía a `https://localhost:9200`,
+que es es01. Con es01 detenido, la salida no puede escribir y reintenta;
+los eventos **se acumulan en la cola en disco** en lugar de perderse.
+(Kibana también usa es01, así que dejará de responder unos minutos: es
+parte del experimento).
+
+#### Paso 20. Reinicia Logstash: la cola sobrevive
+
+``` 
+$ sudo systemctl restart logstash
+$ sleep 30; curl -s localhost:9600/_node/stats/pipelines/syslog | \
+  jq '.pipelines.syslog.queue.events_count'
+1900
+```
+
+**Qué hace y por qué:** con una cola en memoria, el reinicio habría
+perdido los 1 900 eventos. La cola persistente los conserva y los
+procesará cuando el destino vuelva.
+
+#### Paso 21. Restablece el destino y observa la DLQ
+
+``` 
+$ sudo systemctl start es@01
+$ sleep 60
+$ curl -s --cacert $CA -u elastic:$ELASTIC_PWD \
+  "$ES/logs-mercanova.syslog-default/_count"
+{"count":1869, ...}
+$ ls -l /opt/elastic/logstash/data/dead_letter_queue/syslog/
+$ curl -s localhost:9600/_node/stats/pipelines/syslog | jq '
+  .pipelines.syslog.dead_letter_queue'
+```
+
+**Qué hace y por qué:** la cola se vacía (`events_count` vuelve a 0),
+pero solo se indexan **1 869** de 1 900 eventos. Los **31** restantes
+son líneas `CRON[-]`: su `process.pid` vale `"-"` y Elasticsearch los
+rechazó con **400** `document_parsing_exception` porque el campo es
+`long`. En lugar de perderse, quedaron en la **DLQ**. Tercer error
+encontrado: un problema de **datos**, no de conexión.
+
+#### Paso 22. Reprocesa la DLQ
+
+``` 
+$ sudo tee -a /opt/elastic/logstash/config/pipelines.yml \
+  > /dev/null <<'EOF'
+
+- pipeline.id: dlq-syslog
+  path.config: "/opt/elastic/logstash/pipelines/dlq-reprocess.conf"
+  pipeline.workers: 1
+EOF
+$ sudo systemctl restart logstash
+```
+
+Revisa el filtro del pipeline de reproceso:
+
+``` 
+mutate {
+  add_field => { "[error][message]" =>
+    "%{[@metadata][dead_letter_queue][reason]}" }
+  add_tag => [ "reprocessed_from_dlq" ]
+}
+if [process][pid] and [process][pid] !~ /^\d+$/ {
+  mutate { remove_field => [ "[process][pid]" ] }
+}
+```
+
+**Qué hace y por qué:** el input `dead_letter_queue` lee los eventos
+rechazados del pipeline `syslog`; `commit_offsets => true` recuerda lo
+ya leído para no reprocesarlo en el siguiente reinicio. El motivo del
+rechazo, disponible en `@metadata`, se copia a `error.message` para
+auditoría. La corrección elimina el pid no numérico: se pierde un dato
+sin valor (`-`) y se conserva el evento.
+
+#### Paso 23. Verifica que no se perdió ningún evento
+
+``` 
+GET logs-mercanova.syslog-default/_count
+
+GET logs-mercanova.syslog-default/_search
+{
+  "size": 1,
+  "query": { "term": { "tags": "reprocessed_from_dlq" } },
+  "_source": [ "@timestamp", "host.name", "process.name",
+               "message", "error.message" ]
+}
+```
+
+**Qué hace y por qué:** el conteo llega a **1 900**: la suma de 1 869
+eventos directos y 31 reprocesados. El evento reprocesado muestra en
+`error.message` la causa original, por ejemplo,
+`failed to parse field [process.pid] of type [long]`.
+
+#### Paso 24. Comprueba la corrección de la hora
+
+``` 
+GET logs-mercanova.syslog-default/_search
+{
+  "size": 1,
+  "query": { "match_phrase": { "message": "Failed password" } },
+  "sort": [ { "@timestamp": "asc" } ],
+  "_source": [ "@timestamp", "message" ]
+}
+```
+
+**Qué hace y por qué:** compara el `@timestamp` (UTC) con la hora de la
+línea original en el archivo: debe haber exactamente **6 horas** de
+diferencia, que corresponden a UTC-06:00. En Discover, con la zona
+horaria del navegador en México, verás la misma hora del archivo.
+
+### Resultado esperado
+
+-   Elastic Agent **Healthy** como Fleet Server, con la integración de
+    Nginx escribiendo en `logs-nginx.access-default`.
+-   `logs-mercanova.legacy-default` con 400 eventos en ECS, consultable
+    junto con los logs de la práctica 3.
+-   Pipeline `syslog` corregido (host, pid opcional y zona horaria) con
+    cola persistente y DLQ.
+-   `logs-mercanova.syslog-default` con **1 900** eventos: 1 869 directos
+    y 31 reprocesados desde la DLQ, sin fallas de grok.
+-   Puedes explicar la diferencia entre un error de parseo (grok), un
+    error de interpretación (zona horaria) y un rechazo de datos (DLQ), y
+    qué protege cada mecanismo: la PQ contra caídas y la DLQ contra
+    datos inválidos.
+
+### Referencias
+
+-   Elastic. *Fleet and Elastic Agent Guide \[8.19\].*
+    <https://www.elastic.co/guide/en/fleet/8.19/fleet-overview.html>
+-   Elastic. *Elastic Common Schema (ECS) Reference.*
+    <https://www.elastic.co/guide/en/ecs/current/index.html>
+-   Elastic. *Ingest pipelines \[8.19\].*
+    <https://www.elastic.co/guide/en/elasticsearch/reference/8.19/ingest.html>
+-   Elastic. *Logstash: Persistent queues \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/persistent-queues.html>
+-   Elastic. *Logstash: Dead letter queues \[8.19\].*
+    <https://www.elastic.co/guide/en/logstash/8.19/dead-letter-queues.html>
